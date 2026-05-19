@@ -324,14 +324,20 @@ def build_environment_fixes(data: dict) -> list:
 
     security_blocked_count = bl.get("summary", {}).get("security_blocked", 0)
     if security_blocked_count > 0:
+        provider = bl.get("security_blocked_provider") or bl.get("summary", {}).get("security_blocked_provider")
+        provider_label = (
+            f"{provider}"
+            if provider and provider != "unknown"
+            else "WAF / anti-bot non identifié (compatible avec Security Pro PrestaShop, Cloudflare bot fight, Wordfence, etc.)"
+        )
         add(
             "info",
-            f"{security_blocked_count} internal link(s) blocked by WAF/anti-bot (HTTP 403)",
-            "Pattern compatible with Security Pro (PrestaShop), Cloudflare bot fight, "
-            "Wordfence, etc. These are not real broken links for human users.",
-            "Whitelist the audit user-agent in your security module, or run the audit "
-            "from a residential IP. If you suspect a real configuration issue, verify "
-            "manually with a normal browser session.",
+            f"{security_blocked_count} liens internes bloqués par {provider_label} (HTTP 403)",
+            "Ces URLs ne sont pas réellement cassées pour un navigateur humain. "
+            "Le robot d'audit est filtré par la couche de protection du site.",
+            "Whitelister l'user-agent du robot d'audit dans le module de sécurité, "
+            "ou désactiver temporairement la protection pour relancer un crawl propre. "
+            "Si le doute persiste, vérifier 2-3 URLs manuellement avec un navigateur classique.",
         )
 
     og_missing = soc.get("og_missing", [])
