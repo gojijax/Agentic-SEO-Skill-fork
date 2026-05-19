@@ -22,6 +22,15 @@ import time
 from datetime import datetime
 from urllib.parse import urlparse
 
+# Force UTF-8 on stdout/stderr so emoji-laden print() calls (🔍, ⏳, ✅, ⚠️, etc.)
+# don't crash on Windows consoles that default to cp1252.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(SCRIPT_DIR)
 SCORING_CONFIG_PATH = os.path.join(ROOT_DIR, "resources", "config", "scoring.json")

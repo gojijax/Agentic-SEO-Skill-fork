@@ -19,7 +19,17 @@ must follow the urls.json contract produced by audit-prospect-cowork.
 import argparse
 import json
 import os
+import sys
 from urllib.parse import urlparse
+
+# Force UTF-8 on stdout/stderr so emoji prints in generate_report.py don't crash
+# on Windows cp1252 consoles. Idempotent and harmless on Unix.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
 from generate_report import (
     calculate_overall_score,
