@@ -8,6 +8,12 @@ renderers so there is one reporting contract and one scoring config.
 Usage:
     python audit_runner.py https://example.com
     python audit_runner.py https://example.com --json audit.json --html SEO-REPORT.html
+    python audit_runner.py https://example.com --urls-file ./audits/example.com/temp/urls.json
+
+The optional --urls-file flag enables hybrid mode: site-level and aggregate checks
+still run on the root URL, but per-page checks (parse_html, social meta, schema,
+readability, article) are executed for every URL listed in the JSON file. The file
+must follow the urls.json contract produced by audit-prospect-cowork.
 """
 
 import argparse
@@ -54,10 +60,13 @@ def main():
     parser.add_argument("--no-html", action="store_true", help="Do not write the HTML dashboard")
     parser.add_argument("--no-json", action="store_true", help="Do not write JSON results")
     parser.add_argument("--no-markdown", action="store_true", help="Do not write markdown/action-plan artifacts")
+    parser.add_argument("--urls-file", default=None,
+                        help="Optional path to a urls.json file (audit-prospect-cowork contract). "
+                             "Enables hybrid mode: per-page checks iterate over the listed URLs.")
     args = parser.parse_args()
 
     scoring_config = load_scoring_config()
-    data = collect_data(args.url)
+    data = collect_data(args.url, urls_file=args.urls_file)
     scores = calculate_overall_score(data, scoring_config=scoring_config)
     payload = {
         "url": args.url,

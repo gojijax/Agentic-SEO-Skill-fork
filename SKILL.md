@@ -24,6 +24,82 @@ For prompt reliability in Codex/agent IDEs, map common user wording to a fixed w
   - `ACTION-PLAN.md` (prioritized fixes)
 - If `generate_report.py` is run, also return the saved HTML path (for example `SEO-REPORT.html`).
 
+## Hybrid Mode with External URL List (`--urls-file`)
+
+`audit_runner.py` accepts an optional `--urls-file <path>` flag that switches the audit
+to **hybrid mode**. This is the integration point with `audit-prospect-ecommerce`, which
+pre-selects representative URLs (categories, opportunities, strong/weak products,
+blog) via Haloscan and writes them to `urls.json`.
+
+In hybrid mode:
+
+- **Site-level checks** (robots.txt, security headers, llms.txt, hreflang, link
+  profile, internal links, duplicate content, broken links, **url_quality**,
+  **canonical_checker**, **eeat_signal_checker**, **cache_compression_checker**,
+  **indexation_check**) run once on the root URL.
+- **Per-page checks** (parse_html, social meta, redirects, entity, readability,
+  article SEO) run on the root URL **and** on every URL listed in `urls.json`.
+  Results are stored under `data["sections"]["per_page_results"]` as a list of
+  `{url, type, haloscan_source, position, volume, keyword, results}` objects.
+- **Pagespeed + visual analysis** are limited to 3 representative URLs (home +
+  first category + first product, picked by `type`) to stay within the PSI quota
+  and Playwright time budget.
+- **image_inventory + image_weight_audit** run on the same 3 representative URLs.
+- **product_schema_checker** runs on every URL of type `product_strong` /
+  `product_weak`.
+- **freshness_checker** runs on every URL of type `blog_post`.
+- **indexation_check** queries DataForSEO `site:domain` and compares to the
+  sitemap.xml URL count (if discoverable). Skips gracefully without DataForSEO
+  credentials.
+- **manufacturer_dup_check** runs on up to 5 product URLs via DataForSEO SERP
+  to detect descriptions copied from manufacturers.
+
+In default mode (no `--urls-file`), the legacy single-URL deep dive behavior is
+preserved exactly. Hybrid mode is additive, not breaking.
+
+### Expected `urls.json` contract
+
+```json
+{
+  "domain": "example.com",
+  "icp": "B2C, segment cible",
+  "audit_date": "YYYY-MM-DD",
+  "cms_detected": "PrestaShop | WooCommerce | Shopify | Autre",
+  "urls": [
+    {"url": "https://example.com/", "type": "home"},
+    {"url": "...", "type": "category", "haloscan_source": "best_pages",
+     "position": 4, "volume": 1200, "keyword": "..."},
+    {"url": "...", "type": "category_opportunity",
+     "haloscan_source": "positions_10_50", "position": 18, "volume": 800, "keyword": "..."},
+    {"url": "...", "type": "product_strong"},
+    {"url": "...", "type": "product_weak"},
+    {"url": "...", "type": "blog_post"}
+  ],
+  "blog_detected": {"present": true, "location": "/blog/", "subdomain": false}
+}
+```
+
+Allowed `type` values: `home`, `category`, `category_opportunity`, `product_strong`,
+`product_weak`, `blog_post`. Unknown types are tolerated and treated as generic
+pages for per-page checks.
+
+### Manufacturer-copied product description check
+
+When hybrid mode is active, `audit_runner.py` automatically runs
+`manufacturer_dup_check.py` on up to 5 product URLs (`type` = `product_strong` or
+`product_weak`). For each URL the script extracts a ~180-character snippet from
+the main content, queries DataForSEO SERP organic live for the snippet between
+double quotes, and counts how many other domains return it. Above 5 external
+matches, the URL is flagged `manufacturer_copy_suspect: true` and a
+`warning`-severity finding is emitted into the report.
+
+Requires `DATAFORSEO_LOGIN` and `DATAFORSEO_PASSWORD` in the environment (see
+`.env.example`). Without credentials the check is skipped gracefully — the rest
+of the audit pipeline keeps working.
+
+Cost: about $0.003 per checked URL on DataForSEO Live Advanced (≈ $0.015 per
+audit at the default 5 URLs).
+
 ## Available Commands
 
 | Command | Sub-Skill | Description |

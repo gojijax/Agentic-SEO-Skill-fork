@@ -39,6 +39,11 @@ def _candidate_paths() -> list[Path]:
     here = Path(__file__).resolve().parent
     paths.append(here.parent / ".env")
 
+    # Franck's shared credentials hub: a single .env at the root of his ClaudeCode
+    # workspace, shared by every script (bhanunamikaze, audit-prospect-ecommerce,
+    # future skills). Hard-coded path because the machine is fixed.
+    paths.append(Path(r"C:\Users\fairr\DEV\01_ClaudeCode\.env"))
+
     home = os.environ.get("HOME") or os.environ.get("USERPROFILE")
     if home:
         paths.append(Path(home) / ".agentic-seo" / ".env")

@@ -373,17 +373,117 @@ def render_environment_fixes(fixes: list) -> str:
     return html
 
 
-def collect_data(url: str) -> dict:
-    """Run all analysis scripts and collect results."""
+def _load_urls_file(urls_file: str) -> dict | None:
+    """Load and validate a urls.json file produced by audit-prospect-cowork."""
+    if not urls_file or not os.path.exists(urls_file):
+        return None
+    try:
+        with open(urls_file, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"  ⚠️ Could not read urls file {urls_file}: {exc}")
+        return None
+    if not isinstance(payload, dict) or not isinstance(payload.get("urls"), list):
+        print(f"  ⚠️ urls file {urls_file} does not match the expected contract")
+        return None
+    return payload
+
+
+def _run_per_page_analyses(url: str, ptype: str) -> dict:
+    """Run the per-page subset of analyses for a single URL.
+
+    Site-level and aggregate checks are skipped here — they run once on the root
+    URL in collect_data. Pagespeed is intentionally omitted; the caller selects
+    a few representative URLs for it to stay within API quota.
+    """
+    per_page_html = fetch_page(url)
+    section: dict = {"url": url, "type": ptype, "sections": {}}
+    analyses = [
+        ("social", "social_meta.py", [url]),
+        ("redirects", "redirect_checker.py", [url]),
+        ("entity", "entity_checker.py", [url]),
+        ("hreflang", "hreflang_checker.py", [url]),
+        ("article", "article_seo.py", [url]),
+    ]
+    if per_page_html and os.path.exists(per_page_html):
+        analyses.append(("onpage", "parse_html.py", [per_page_html, "--url", url]))
+        analyses.append(("readability", "readability.py", [per_page_html]))
+    for name, script, args in analyses:
+        start = time.time()
+        result = run_script(script, args)
+        elapsed = round(time.time() - start, 1)
+        section["sections"][name] = result
+        status = "⚠️" if "error" in result and result.get("error") else "✅"
+        print(f"    {status} {script} on {url} ({elapsed}s)")
+    if per_page_html and os.path.exists(per_page_html):
+        try:
+            os.unlink(per_page_html)
+        except OSError:
+            pass
+    return section
+
+
+def _select_pagespeed_targets(urls_meta: dict, root_url: str) -> list[str]:
+    """Pick up to 3 representative URLs for pagespeed: home + first category + first product."""
+    targets = [root_url]
+    by_type: dict[str, list[str]] = {}
+    for entry in urls_meta.get("urls", []):
+        if not isinstance(entry, dict):
+            continue
+        ptype = entry.get("type") or "page"
+        href = entry.get("url")
+        if not href or href == root_url:
+            continue
+        by_type.setdefault(ptype, []).append(href)
+    for ptype in ("category", "category_opportunity", "product_strong", "product_weak"):
+        bucket = by_type.get(ptype) or []
+        if bucket and bucket[0] not in targets:
+            targets.append(bucket[0])
+        if len(targets) >= 3:
+            break
+    return targets[:3]
+
+
+def _urls_by_type(urls_meta: dict, *types: str) -> list[str]:
+    """Extract URLs of the given types from urls_meta, preserving order."""
+    out: list[str] = []
+    for entry in urls_meta.get("urls", []):
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("type") in types and entry.get("url"):
+            out.append(entry["url"])
+    return out
+
+
+def collect_data(url: str, urls_file: str | None = None) -> dict:
+    """Run all analysis scripts and collect results.
+
+    Default mode (urls_file is None): legacy single-URL deep-dive.
+    Hybrid mode (urls_file is set): site-level + aggregate checks on root URL,
+    per-page checks iterated over the URLs listed in urls_file.
+    """
     print(f"🔍 Analyzing {url}...")
+    urls_meta = _load_urls_file(urls_file) if urls_file else None
+    extra_urls: list[dict] = []
+    if urls_meta:
+        extra_urls = [
+            entry for entry in urls_meta.get("urls", [])
+            if isinstance(entry, dict) and entry.get("url") and entry.get("url") != url
+        ]
+        print(f"  ℹ️ Hybrid mode: {len(extra_urls)} additional URL(s) from {urls_file}")
+
     data = {
         "url": url,
         "domain": urlparse(url).netloc,
         "timestamp": datetime.now().isoformat(),
         "sections": {},
+        "mode": "hybrid" if urls_meta else "single_url",
     }
+    if urls_meta:
+        data["urls_meta"] = urls_meta
+        data["urls_file"] = os.path.abspath(urls_file)
 
-    # Fetch page for parse_html and readability
+    # Fetch root page for parse_html and readability
     print("  ⏳ Fetching page HTML...")
     html_path = fetch_page(url)
     page_html = ""
@@ -395,27 +495,78 @@ def collect_data(url: str) -> dict:
             page_html = ""
     data["environment"] = detect_environment(page_html, url)
 
+    # Site-level and aggregate checks — always run on the root URL regardless of mode
+    pagespeed_targets = (
+        _select_pagespeed_targets(urls_meta, url) if urls_meta else [url]
+    )
+    # url_quality: in hybrid mode, run on all URLs from the list; otherwise root only.
+    if urls_meta:
+        url_quality_args = [url] + [
+            entry["url"] for entry in urls_meta.get("urls", [])
+            if isinstance(entry, dict) and entry.get("url") and entry["url"] != url
+        ]
+    else:
+        url_quality_args = [url]
     analyses = [
         ("robots", "robots_checker.py", [url]),
         ("security", "security_headers.py", [url]),
-        ("social", "social_meta.py", [url]),
-        ("redirects", "redirect_checker.py", [url]),
         ("llms_txt", "llms_txt_checker.py", [url]),
         ("broken_links", "broken_links.py", [url, "--workers", "5", "--timeout", "8"]),
         ("internal_links", "internal_links.py", [url, "--depth", "1", "--max-pages", "15"]),
-        ("pagespeed", "pagespeed.py", [url, "--strategy", "mobile"]),
-        # New analysis scripts (supplementary — failures don't block report)
-        ("entity", "entity_checker.py", [url]),
         ("link_profile", "link_profile.py", [url, "--max-pages", "20"]),
         ("hreflang", "hreflang_checker.py", [url]),
         ("duplicate_content", "duplicate_content.py", [url]),
+        ("url_quality", "url_quality.py", url_quality_args),
+        # E-commerce-specific enrichment scripts (site-level part)
+        ("canonical", "canonical_checker.py", url_quality_args),
+        ("eeat_signal", "eeat_signal_checker.py", [url]),
+        ("cache_compression", "cache_compression_checker.py", [url]),
     ]
 
-    # Add parse_html and readability if page was fetched
+    # Image and performance details on representative URLs (same targets as pagespeed)
+    for target in pagespeed_targets:
+        key = "image_inventory" if target == url else f"image_inventory:{target}"
+        analyses.append((key, "image_inventory.py", [target]))
+        key = "image_weight" if target == url else f"image_weight:{target}"
+        analyses.append((key, "image_weight_audit.py", [target]))
+
+    # Product schema validation on product URLs only
+    if urls_meta:
+        for prod_url in _urls_by_type(urls_meta, "product_strong", "product_weak", "product"):
+            analyses.append((f"product_schema:{prod_url}", "product_schema_checker.py", [prod_url]))
+
+    # Freshness check on blog posts (relevant for articles, less so for product pages)
+    if urls_meta:
+        for blog_url in _urls_by_type(urls_meta, "blog_post"):
+            analyses.append((f"freshness:{blog_url}", "freshness_checker.py", [blog_url]))
+
+    # In single-URL mode, per-page scripts run on root URL alongside site-level ones.
+    # In hybrid mode, they run inside _run_per_page_analyses for each listed URL,
+    # but we still keep the root URL's per-page results in the standard sections for
+    # downstream renderers (scoring/markdown) that expect them.
+    analyses.extend([
+        ("social", "social_meta.py", [url]),
+        ("redirects", "redirect_checker.py", [url]),
+        ("entity", "entity_checker.py", [url]),
+    ])
     if html_path:
         analyses.append(("onpage", "parse_html.py", [html_path, "--url", url]))
         analyses.append(("readability", "readability.py", [html_path]))
         analyses.append(("article", "article_seo.py", [url]))
+    for target in pagespeed_targets:
+        key = "pagespeed" if target == url else f"pagespeed:{target}"
+        analyses.append((key, "pagespeed.py", [target, "--strategy", "mobile"]))
+
+    # Visual / mobile responsiveness check on the same representative URLs as pagespeed.
+    # Requires Playwright — script skips gracefully if unavailable.
+    for target in pagespeed_targets:
+        key = "visual" if target == url else f"visual:{target}"
+        analyses.append((key, "analyze_visual.py", [target]))
+
+    # Indexation check via DataForSEO site: query + sitemap.xml count.
+    # Skips automatically if DataForSEO creds are missing.
+    indexation_domain = urlparse(url).netloc.lstrip("www.")
+    analyses.append(("indexation", "indexation_check.py", ["--domain", indexation_domain]))
 
     for name, script, args in analyses:
         print(f"  ⏳ Running {script}...")
@@ -426,9 +577,51 @@ def collect_data(url: str) -> dict:
         status = "⚠️ error" if "error" in result and result.get("error") else "✅"
         print(f"  {status} {script} ({elapsed}s)")
 
+    # Per-page loop for hybrid mode
+    if extra_urls:
+        print(f"  🔁 Running per-page checks on {len(extra_urls)} additional URL(s)...")
+        per_page_results: list[dict] = []
+        for entry in extra_urls:
+            href = entry["url"]
+            ptype = entry.get("type", "page")
+            print(f"   → {ptype}: {href}")
+            per_page_results.append({
+                "url": href,
+                "type": ptype,
+                "haloscan_source": entry.get("haloscan_source"),
+                "position": entry.get("position"),
+                "volume": entry.get("volume"),
+                "keyword": entry.get("keyword"),
+                "results": _run_per_page_analyses(href, ptype)["sections"],
+            })
+        data["sections"]["per_page_results"] = per_page_results
+
+        # Manufacturer-copied product description check (DataForSEO SERP based).
+        # Skipped automatically by the script if DATAFORSEO_LOGIN/PASSWORD are missing.
+        print("  🏭 Running manufacturer description duplicate check (DataForSEO)...")
+        start = time.time()
+        dup_result = run_script(
+            "manufacturer_dup_check.py",
+            ["--urls-file", urls_file],
+            timeout=300,
+        )
+        elapsed = round(time.time() - start, 1)
+        data["sections"]["manufacturer_dup_check"] = dup_result
+        if dup_result.get("skipped"):
+            print(f"  ⏭️ manufacturer_dup_check skipped: {dup_result.get('reason')} ({elapsed}s)")
+        elif dup_result.get("error"):
+            print(f"  ⚠️ manufacturer_dup_check error: {dup_result.get('error')} ({elapsed}s)")
+        else:
+            print(f"  ✅ manufacturer_dup_check: "
+                  f"{dup_result.get('products_suspect', 0)}/{dup_result.get('products_checked', 0)} "
+                  f"suspects ({elapsed}s)")
+
     # Cleanup temp file
     if html_path and os.path.exists(html_path):
-        os.unlink(html_path)
+        try:
+            os.unlink(html_path)
+        except OSError:
+            pass
 
     data["environment_fixes"] = build_environment_fixes(data)
 
@@ -746,41 +939,60 @@ def _severity_label(severity: str) -> str:
     return "Info"
 
 
+def _findings_from_section(section_data: dict, section_name: str, area_prefix: str = "") -> list[dict]:
+    """Pull issues from a single section dict and label them with the given area prefix."""
+    out: list[dict] = []
+    if not isinstance(section_data, dict):
+        return out
+    area_base = f"{area_prefix}{section_name}" if area_prefix else section_name
+    if section_data.get("error"):
+        out.append({
+            "severity": "info",
+            "area": area_base,
+            "finding": f"{section_name} measurement incomplete",
+            "evidence": section_data.get("error"),
+            "fix": "Rerun this check after resolving the environment/API/network limitation.",
+        })
+    for issue in section_data.get("issues", []) or []:
+        if isinstance(issue, dict):
+            out.append({
+                "severity": _severity_label(issue.get("severity", "info")),
+                "area": issue.get("area") or area_base,
+                "finding": issue.get("finding") or issue.get("title") or str(issue),
+                "evidence": issue.get("evidence") or issue.get("reason") or "",
+                "fix": issue.get("fix") or issue.get("recommendation") or "",
+            })
+        elif isinstance(issue, str):
+            severity = "critical" if "🔴" in issue else "warning" if "⚠️" in issue else "info"
+            out.append({
+                "severity": _severity_label(severity),
+                "area": area_base,
+                "finding": issue,
+                "evidence": "",
+                "fix": "",
+            })
+    return out
+
+
 def collect_report_findings(data: dict) -> list[dict]:
-    """Collect findings from section outputs, script errors, and environment fixes."""
+    """Collect findings from section outputs, per-page results, errors and environment fixes."""
     findings: list[dict] = []
 
     for section_name, section_data in data.get("sections", {}).items():
-        if not isinstance(section_data, dict):
+        if section_name == "per_page_results":
+            # Hybrid mode: this section holds a list of {url, type, results} dicts.
+            if not isinstance(section_data, list):
+                continue
+            for entry in section_data:
+                if not isinstance(entry, dict):
+                    continue
+                page_url = entry.get("url", "?")
+                page_type = entry.get("type", "page")
+                prefix = f"{page_type} @ {page_url} :: "
+                for sub_name, sub_data in (entry.get("results") or {}).items():
+                    findings.extend(_findings_from_section(sub_data, sub_name, area_prefix=prefix))
             continue
-
-        if section_data.get("error"):
-            findings.append({
-                "severity": "info",
-                "area": section_name,
-                "finding": f"{section_name} measurement incomplete",
-                "evidence": section_data.get("error"),
-                "fix": "Rerun this check after resolving the environment/API/network limitation.",
-            })
-
-        for issue in section_data.get("issues", []) or []:
-            if isinstance(issue, dict):
-                findings.append({
-                    "severity": _severity_label(issue.get("severity", "info")),
-                    "area": issue.get("area") or section_name,
-                    "finding": issue.get("finding") or issue.get("title") or str(issue),
-                    "evidence": issue.get("evidence") or issue.get("reason") or "",
-                    "fix": issue.get("fix") or issue.get("recommendation") or "",
-                })
-            elif isinstance(issue, str):
-                severity = "critical" if "🔴" in issue else "warning" if "⚠️" in issue else "info"
-                findings.append({
-                    "severity": _severity_label(severity),
-                    "area": section_name,
-                    "finding": issue,
-                    "evidence": "",
-                    "fix": "",
-                })
+        findings.extend(_findings_from_section(section_data, section_name))
 
     for item in data.get("environment_fixes", []) or []:
         findings.append({
@@ -828,9 +1040,10 @@ def render_markdown_report(data: dict, scores: dict, scoring_config: dict | None
         lines.append(f"| {_markdown_cell(label)} | {weight} | {score} |")
 
     lines.extend(["", "## Findings", ""])
+    findings_cap = 200 if "per_page_results" in data.get("sections", {}) else 50
     if findings:
         lines.extend(["| Severity | Area | Finding | Evidence | Fix |", "| --- | --- | --- | --- | --- |"])
-        for item in findings[:50]:
+        for item in findings[:findings_cap]:
             lines.append(
                 "| {severity} | {area} | {finding} | {evidence} | {fix} |".format(
                     severity=_markdown_cell(item.get("severity")),
@@ -840,8 +1053,57 @@ def render_markdown_report(data: dict, scores: dict, scoring_config: dict | None
                     fix=_markdown_cell(item.get("fix")),
                 )
             )
+        if len(findings) > findings_cap:
+            lines.append(f"\n*(Truncated to {findings_cap} of {len(findings)} findings — full set in audit-results.json.)*")
     else:
         lines.append("No confirmed findings were produced by the completed checks.")
+
+    per_page = data.get("sections", {}).get("per_page_results")
+    if isinstance(per_page, list) and per_page:
+        lines.extend(["", "## Per-URL Detail (hybrid mode)", ""])
+        urls_meta = data.get("urls_meta") or {}
+        if urls_meta.get("cms_detected"):
+            lines.append(f"- CMS detected (urls.json): `{urls_meta.get('cms_detected')}`")
+        lines.append(f"- URLs audited from list: `{len(per_page)}`")
+        lines.append("")
+        lines.extend([
+            "| URL | Type | Keyword | Title | H1 | Meta | Word count | Notes |",
+            "| --- | --- | --- | --- | --- | --- | ---: | --- |",
+        ])
+        for entry in per_page:
+            url = entry.get("url", "?")
+            ptype = entry.get("type", "page")
+            keyword = entry.get("keyword") or ""
+            onpage = (entry.get("results") or {}).get("onpage", {}) or {}
+            title_text = onpage.get("title") or "—"
+            h1_list = onpage.get("headings", {}).get("h1") if isinstance(onpage.get("headings"), dict) else None
+            h1_text = (h1_list[0] if isinstance(h1_list, list) and h1_list else "—") or "—"
+            meta_text = onpage.get("meta_description") or "—"
+            word_count = onpage.get("word_count")
+            notes_bits: list[str] = []
+            if onpage.get("canonical"):
+                notes_bits.append(f"canonical={onpage.get('canonical')}")
+            if onpage.get("meta_robots"):
+                notes_bits.append(f"robots={onpage.get('meta_robots')}")
+            issues_count = sum(
+                len((sub or {}).get("issues") or [])
+                for sub in (entry.get("results") or {}).values()
+                if isinstance(sub, dict)
+            )
+            if issues_count:
+                notes_bits.append(f"{issues_count} issue(s)")
+            lines.append(
+                "| {url} | {ptype} | {kw} | {title} | {h1} | {meta} | {wc} | {notes} |".format(
+                    url=_markdown_cell(url),
+                    ptype=_markdown_cell(ptype),
+                    kw=_markdown_cell(keyword),
+                    title=_markdown_cell(title_text[:80] if title_text else "—"),
+                    h1=_markdown_cell(h1_text[:80] if h1_text else "—"),
+                    meta=_markdown_cell((meta_text[:80] + "...") if meta_text and len(meta_text) > 80 else (meta_text or "—")),
+                    wc=_markdown_cell(word_count if word_count is not None else "—"),
+                    notes=_markdown_cell("; ".join(notes_bits) or "—"),
+                )
+            )
 
     lines.extend(["", "## Measurement Notes", ""])
     if error_count:
