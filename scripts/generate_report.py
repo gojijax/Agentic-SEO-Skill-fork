@@ -322,6 +322,18 @@ def build_environment_fixes(data: dict) -> list:
             _platform_hint(platform, "links"),
         )
 
+    security_blocked_count = bl.get("summary", {}).get("security_blocked", 0)
+    if security_blocked_count > 0:
+        add(
+            "info",
+            f"{security_blocked_count} internal link(s) blocked by WAF/anti-bot (HTTP 403)",
+            "Pattern compatible with Security Pro (PrestaShop), Cloudflare bot fight, "
+            "Wordfence, etc. These are not real broken links for human users.",
+            "Whitelist the audit user-agent in your security module, or run the audit "
+            "from a residential IP. If you suspect a real configuration issue, verify "
+            "manually with a normal browser session.",
+        )
+
     og_missing = soc.get("og_missing", [])
     tw_missing = soc.get("twitter_missing", [])
     if og_missing or tw_missing:
@@ -1079,6 +1091,35 @@ def render_markdown_report(data: dict, scores: dict, scoring_config: dict | None
         score = scores.get("categories", {}).get(key, 0)
         lines.append(f"| {_markdown_cell(label)} | {weight} | {score} |")
 
+    # Audit coverage — exhaustive list of checks that ran with status
+    lines.extend(["", "## Audit Coverage", "",
+                  "Liste exhaustive des scripts exécutés, avec leur statut. Un check sans issue est aussi un signal — il confirme que la dimension a bien été couverte.",
+                  "",
+                  "| Section | Statut | Issues remontées | Note |",
+                  "| --- | --- | ---: | --- |"])
+    for section_name in sorted(data.get("sections", {}).keys()):
+        section_data = data["sections"][section_name]
+        if section_name == "per_page_results":
+            count = len(section_data) if isinstance(section_data, list) else 0
+            lines.append(f"| per_page_results | ran | {count} URL(s) | hybrid mode per-page checks |")
+            continue
+        if not isinstance(section_data, dict):
+            continue
+        err = section_data.get("error")
+        skipped = section_data.get("skipped")
+        if err:
+            status = "error"
+            note = str(err)[:120]
+        elif skipped:
+            status = "skipped"
+            note = str(section_data.get("reason") or "")[:120]
+        else:
+            status = "ran"
+            score = section_data.get("score")
+            note = f"score {score}" if isinstance(score, (int, float)) else "—"
+        issues_count = len(section_data.get("issues", []) or [])
+        lines.append(f"| {_markdown_cell(section_name)} | {status} | {issues_count} | {_markdown_cell(note)} |")
+
     lines.extend(["", "## Findings", ""])
     findings_cap = 200 if "per_page_results" in data.get("sections", {}) else 50
     if findings:
@@ -1144,6 +1185,49 @@ def render_markdown_report(data: dict, scores: dict, scoring_config: dict | None
                     notes=_markdown_cell("; ".join(notes_bits) or "—"),
                 )
             )
+
+        # Per-URL expanded detail (one block per URL) — exhaustive trace for audit roadmap
+        lines.extend(["", "### Détail par URL (Hn complets, meta, extrait texte)", ""])
+        for entry in per_page:
+            url = entry.get("url", "?")
+            ptype = entry.get("type", "page")
+            onpage = (entry.get("results") or {}).get("onpage", {}) or {}
+            headings = onpage.get("headings") if isinstance(onpage.get("headings"), dict) else {}
+            h1_list = headings.get("h1") or []
+            h2_list = headings.get("h2") or []
+            h3_list = headings.get("h3") or []
+            h4_list = headings.get("h4") or []
+            title_text = onpage.get("title") or "—"
+            meta_text = onpage.get("meta_description") or "—"
+            canonical = onpage.get("canonical") or "—"
+            meta_robots = onpage.get("meta_robots") or "—"
+            word_count = onpage.get("word_count")
+            lang_attr = onpage.get("lang") or "—"
+
+            lines.append(f"**{ptype} — {url}**")
+            lines.append("")
+            lines.append(f"- Title: `{title_text}` ({len(title_text) if title_text != '—' else 0} chars)")
+            lines.append(f"- Meta description: `{meta_text}` ({len(meta_text) if meta_text != '—' else 0} chars)")
+            lines.append(f"- Canonical: `{canonical}`")
+            lines.append(f"- Meta robots: `{meta_robots}`")
+            lines.append(f"- Lang: `{lang_attr}` — Word count: `{word_count if word_count is not None else '—'}`")
+            if h1_list:
+                lines.append(f"- H1 ({len(h1_list)}):")
+                for h in h1_list[:5]:
+                    lines.append(f"  - `{h}`")
+            else:
+                lines.append(f"- H1: aucun détecté")
+            if h2_list:
+                lines.append(f"- H2 ({len(h2_list)}):")
+                for h in h2_list[:10]:
+                    lines.append(f"  - `{h}`")
+            if h3_list:
+                lines.append(f"- H3 ({len(h3_list)}):")
+                for h in h3_list[:15]:
+                    lines.append(f"  - `{h}`")
+            if h4_list:
+                lines.append(f"- H4 ({len(h4_list)})")
+            lines.append("")
 
     lines.extend(["", "## Measurement Notes", ""])
     if error_count:

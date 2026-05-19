@@ -124,6 +124,7 @@ def check_broken_links(url: str, internal_only: bool = False,
         "broken": [],
         "redirected": [],
         "timeout": [],
+        "security_blocked": [],
         "healthy": 0,
         "summary": {},
         "issues": [],
@@ -160,7 +161,10 @@ def check_broken_links(url: str, internal_only: bool = False,
             checked.append(future.result())
 
     result["checked"] = len(checked)
+    result["security_blocked"] = []
 
+    # First pass: split candidates without committing 403 same-host yet
+    pending_403_internal: list[dict] = []
     for link in checked:
         status = link["status"]
 
@@ -169,12 +173,25 @@ def check_broken_links(url: str, internal_only: bool = False,
                 result["timeout"].append(link)
             else:
                 result["broken"].append(link)
+        elif status == 403 and link.get("is_internal"):
+            # Likely WAF/anti-bot — defer decision until we count the pattern.
+            pending_403_internal.append(link)
         elif status and status >= 400:
             result["broken"].append(link)
         elif link["redirect"]:
             result["redirected"].append(link)
         else:
             result["healthy"] += 1
+
+    # If 5+ internal 403s, assume it's a WAF/anti-bot pattern (Security Pro on
+    # PrestaShop, Cloudflare bot fight mode, etc.). These are not real broken
+    # links — a human browser reaches them fine. Reroute them to security_blocked
+    # so they don't pollute the broken count or the score.
+    if len(pending_403_internal) >= 5:
+        result["security_blocked"] = pending_403_internal
+    else:
+        # Few sparse 403s → genuine errors, count as broken
+        result["broken"].extend(pending_403_internal)
 
     # Generate summary
     result["summary"] = {
@@ -183,6 +200,7 @@ def check_broken_links(url: str, internal_only: bool = False,
         "broken": len(result["broken"]),
         "redirected": len(result["redirected"]),
         "timeout": len(result["timeout"]),
+        "security_blocked": len(result["security_blocked"]),
     }
 
     # Generate issues
@@ -193,6 +211,13 @@ def check_broken_links(url: str, internal_only: bool = False,
     if result["timeout"]:
         result["issues"].append(
             f"⚠️ {len(result['timeout'])} link(s) timed out"
+        )
+    if result["security_blocked"]:
+        result["issues"].append(
+            f"ℹ️ {len(result['security_blocked'])} internal link(s) return 403 — "
+            "pattern compatible with WAF/anti-bot protection (Security Pro, Cloudflare bot fight, "
+            "Wordfence). These are not actual broken links; verify with a normal browser session "
+            "or whitelist the audit user-agent."
         )
     if result["redirected"]:
         chains = [l for l in result["redirected"]
