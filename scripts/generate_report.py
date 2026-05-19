@@ -1012,7 +1012,38 @@ def collect_report_findings(data: dict) -> list[dict]:
             "fix": item.get("fix", ""),
         })
 
-    return sorted(findings, key=lambda item: (_severity_rank(item.get("severity", "info")), item.get("area", "")))
+    # Dedup findings that repeat across pages (e.g. "No Organization entity"
+    # firing once per URL in hybrid mode). We keep the first area as primary
+    # and roll up the count.
+    deduped: dict[tuple, dict] = {}
+    for f in findings:
+        key = (
+            f.get("severity"),
+            (f.get("finding") or "")[:250],
+            (f.get("fix") or "")[:250],
+        )
+        if key in deduped:
+            existing = deduped[key]
+            existing["_dup_count"] = existing.get("_dup_count", 1) + 1
+            other_areas = existing.setdefault("_dup_areas", [])
+            if len(other_areas) < 5:
+                other_areas.append(f.get("area", ""))
+        else:
+            f["_dup_count"] = 1
+            deduped[key] = f
+
+    rolled_up: list[dict] = []
+    for f in deduped.values():
+        count = f.pop("_dup_count", 1)
+        others = f.pop("_dup_areas", [])
+        if count > 1:
+            sample = ", ".join(a for a in others if a)[:200]
+            extra = f"Constaté sur {count} sections/URLs (sample: {f.get('area')}{', ' + sample if sample else ''})."
+            existing_ev = f.get("evidence") or ""
+            f["evidence"] = f"{extra} {existing_ev}".strip()
+        rolled_up.append(f)
+
+    return sorted(rolled_up, key=lambda item: (_severity_rank(item.get("severity", "info")), item.get("area", "")))
 
 
 def render_markdown_report(data: dict, scores: dict, scoring_config: dict | None = None) -> str:
@@ -1201,11 +1232,13 @@ def generate_html(data: dict, scores: dict) -> str:
 
     # Collect all issues
     all_issues = []
-    for section_name, section_data in data["sections"].items():
+
+    def _push_issues_from_section(section_data, section_name):
+        if not isinstance(section_data, dict):
+            return
         issues = section_data.get("issues", [])
         for issue in issues:
             if isinstance(issue, dict):
-                # Structured issue from entity_checker, hreflang_checker, etc.
                 sev_raw = issue.get("severity", "info").lower()
                 severity_map = {"critical": "critical", "high": "critical", "warning": "warning", "medium": "warning", "info": "info", "low": "info"}
                 severity = severity_map.get(sev_raw, "info")
@@ -1214,6 +1247,22 @@ def generate_html(data: dict, scores: dict) -> str:
             elif isinstance(issue, str):
                 severity = "critical" if "🔴" in issue else "warning" if "⚠️" in issue else "info"
                 all_issues.append({"text": issue, "severity": severity, "section": section_name})
+
+    for section_name, section_data in data["sections"].items():
+        if section_name == "per_page_results":
+            # Hybrid mode: list of {url, type, results} dicts. Walk into each sub-section.
+            if not isinstance(section_data, list):
+                continue
+            for entry in section_data:
+                if not isinstance(entry, dict):
+                    continue
+                page_url = entry.get("url", "?")
+                page_type = entry.get("type", "page")
+                prefix = f"{page_type} @ {page_url}"
+                for sub_name, sub_data in (entry.get("results") or {}).items():
+                    _push_issues_from_section(sub_data, f"{prefix} :: {sub_name}")
+            continue
+        _push_issues_from_section(section_data, section_name)
 
     critical_count = sum(1 for i in all_issues if i["severity"] == "critical")
     warning_count = sum(1 for i in all_issues if i["severity"] == "warning")
