@@ -60,6 +60,48 @@ NOISE_CLASSES = (
     "account", "compte", "search-bar", "search", "login", "register",
     "popup", "modal", "overlay", "toolbar", "loader", "loading", "spinner",
 )
+
+# CSS selectors for the LONG description block, by CMS. Order matters: try the
+# most specific first. The matching block (>= 100 chars) is preferred over a
+# generic body scan because it isolates the prose actually written for the
+# product (vs short summary / specs table / cross-sell).
+LONG_DESCRIPTION_SELECTORS = [
+    # PrestaShop
+    ".product-description",
+    "#product-description",
+    ".tab-pane#description",
+    ".product-information .product-description",
+    # WooCommerce
+    "#tab-description",
+    ".woocommerce-tabs .panel#tab-description",
+    ".woocommerce-Tabs-panel--description",
+    # Shopify
+    ".product__description",
+    ".product-single__description",
+    ".product-content",
+    # Magento
+    ".product.attribute.description .value",
+    "#description.value",
+    # Drupal Commerce
+    ".field--name-body",
+    ".field--name-field-description",
+    # WordPress (generic, last resort)
+    ".entry-content",
+    "#post-content",
+    # Common fallback inside any CMS
+    "[itemprop='description']",
+]
+# Selectors to ALWAYS strip before extracting the description (short summaries
+# that pollute the duplicate-text signal because they're usually short and reused)
+SHORT_SUMMARY_SELECTORS = [
+    ".product-short-description",
+    ".woocommerce-product-details__short-description",
+    ".product__excerpt",
+    ".product-meta__excerpt",
+    ".product.attribute.overview",
+    ".excerpt",
+    ".summary-content",
+]
 # UI words that, if present in a snippet, mean it's most likely cart/account
 # chrome rather than product description. A snippet with any of these is rejected.
 UI_GENERIC_WORDS = {
@@ -78,21 +120,46 @@ def _is_ui_chrome(snippet: str) -> bool:
     return any(w in s for w in UI_GENERIC_WORDS)
 
 
-def _clean_text(soup: BeautifulSoup) -> str:
+def _clean_text(soup: BeautifulSoup) -> tuple[str, str]:
+    """Return (text, source_selector). source_selector identifies which strategy
+    picked the text — useful to diagnose why a snippet looks weird."""
+    # 1) Strip noise tags + classes
     for tag in soup.find_all(NOISE_TAGS):
         tag.decompose()
     for tag in soup.find_all(class_=lambda c: c and any(n in " ".join(c).lower() for n in NOISE_CLASSES)):
         tag.decompose()
+    # 2) Strip short-summary blocks BEFORE picking the long description
+    for sel in SHORT_SUMMARY_SELECTORS:
+        try:
+            for tag in soup.select(sel):
+                tag.decompose()
+        except Exception:
+            continue
+    # 3) Prefer CMS-aware long-description selectors
+    for sel in LONG_DESCRIPTION_SELECTORS:
+        try:
+            zone = soup.select_one(sel)
+        except Exception:
+            continue
+        if zone:
+            text = zone.get_text(separator=" ", strip=True)
+            if len(text) > 100:
+                return re.sub(r"\s+", " ", text), f"long_description:{sel}"
+    # 4) Generic main containers as a fallback
     for sel in ("main", "[id*='main']", "[class*='main']", "[class*='product']", "article"):
-        zone = soup.select_one(sel)
+        try:
+            zone = soup.select_one(sel)
+        except Exception:
+            continue
         if zone:
             text = zone.get_text(separator=" ", strip=True)
             if len(text) > 200:
-                return re.sub(r"\s+", " ", text)
+                return re.sub(r"\s+", " ", text), f"main_zone:{sel}"
+    # 5) Body fallback
     body = soup.body
     if body:
-        return re.sub(r"\s+", " ", body.get_text(separator=" ", strip=True))
-    return ""
+        return re.sub(r"\s+", " ", body.get_text(separator=" ", strip=True)), "body"
+    return "", "none"
 
 
 def _extract_snippets(text: str, snippet_len: int, max_candidates: int = 3) -> list[str]:
@@ -165,13 +232,16 @@ def _fetch_snippet(url: str, snippet_len: int, timeout: int = 12) -> dict:
     else:
         html_text = resp.text
     soup = BeautifulSoup(html_text, "html.parser")
-    text = _clean_text(soup)
+    text, source = _clean_text(soup)
     snippets = _extract_snippets(text, snippet_len)
     if not snippets or all(len(s) < 60 for s in snippets):
-        out["fetch_error"] = "main content too short to extract a distinctive snippet"
+        out["fetch_error"] = f"main content too short ({len(text)} chars from {source})"
+        out["text_source"] = source
         return out
     out["snippets"] = snippets
     out["snippet"] = snippets[0]  # backward compat
+    out["text_source"] = source
+    out["text_length"] = len(text)
     return out
 
 
@@ -270,6 +340,8 @@ def run(urls_file: str, max_urls: int, snippet_len: int, threshold: int,
             "snippet": page.get("snippet"),  # the primary one shown in report
             "snippets_tried": snippets_tried,
             "fetch_error": page.get("fetch_error"),
+            "text_source": page.get("text_source"),
+            "text_length": page.get("text_length"),
             "external_domains_count": None,
             "external_domains_sample": [],
             "manufacturer_copy_suspect": False,
@@ -277,14 +349,20 @@ def run(urls_file: str, max_urls: int, snippet_len: int, threshold: int,
             "per_snippet_results": [],
         }
         if snippets_tried:
-            # Union the unique external domains across all snippet queries
-            all_domains: set[str] = set()
+            # Per-domain count across snippets: a domain that appears in 2+
+            # snippets is a much stronger signal of duplicated description
+            # than a domain matched on a single snippet.
+            domain_hits: dict[str, int] = {}
+            matched_snippets = 0
             statuses = []
             for snip in snippets_tried:
                 try:
                     response = _dataforseo_serp(snip, login, password)
                     parsed = _parse_serp_response(response, audited_domain)
-                    all_domains.update(parsed["domains"])
+                    if parsed["domains"]:
+                        matched_snippets += 1
+                    for d in parsed["domains"]:
+                        domain_hits[d] = domain_hits.get(d, 0) + 1
                     statuses.append(parsed["raw_status"] or "ok")
                     record["per_snippet_results"].append({
                         "snippet": snip[:80],
@@ -297,10 +375,40 @@ def run(urls_file: str, max_urls: int, snippet_len: int, threshold: int,
                         "snippet": snip[:80],
                         "error": str(exc),
                     })
-            record["external_domains_count"] = len(all_domains)
-            record["external_domains_sample"] = sorted(all_domains)[:10]
+
+            total_unique = len(domain_hits)
+            recurrent = sorted(
+                [d for d, c in domain_hits.items() if c >= 2],
+                key=lambda d: (-domain_hits[d], d),
+            )
+
+            # Intensity: how many of the tested snippets matched at least one
+            # external domain. A single snippet matching is weak signal; all
+            # three matching is overwhelming.
+            total_snippets = len(snippets_tried)
+            if matched_snippets == 0:
+                intensity = "NONE"
+            elif matched_snippets == 1:
+                intensity = "LOW"
+            elif matched_snippets == 2:
+                intensity = "MEDIUM"
+            else:
+                intensity = "HIGH"
+
+            record["external_domains_count"] = total_unique
+            record["external_domains_sample"] = sorted(domain_hits.keys())[:10]
+            record["recurrent_domains"] = [
+                {"domain": d, "matched_snippets": domain_hits[d]}
+                for d in recurrent[:10]
+            ]
+            record["matched_snippets"] = matched_snippets
+            record["total_snippets"] = total_snippets
+            record["intensity"] = intensity
             record["serp_status"] = "; ".join(statuses)
-            if record["external_domains_count"] >= threshold:
+
+            # Suspect if either total unique domains crosses threshold OR
+            # intensity is MEDIUM/HIGH (which is independent of threshold).
+            if total_unique >= threshold or intensity in ("MEDIUM", "HIGH"):
                 record["manufacturer_copy_suspect"] = True
                 suspect_count += 1
         checked.append(record)
@@ -308,20 +416,39 @@ def run(urls_file: str, max_urls: int, snippet_len: int, threshold: int,
     issues: list[dict] = []
     for record in checked:
         if record.get("manufacturer_copy_suspect"):
-            sample_domains = ", ".join(record.get("external_domains_sample") or [])
+            intensity = record.get("intensity", "?")
+            matched = record.get("matched_snippets", 0)
+            total = record.get("total_snippets", 0)
+            recurrent = record.get("recurrent_domains") or []
+            unique_count = record.get("external_domains_count", 0)
+
+            # Recurrent domains are the strongest signal — list them first
+            recurrent_str = (
+                ", ".join(f"{r['domain']} ({r['matched_snippets']} snippets)" for r in recurrent[:5])
+                if recurrent else "aucun domaine ne matche sur plusieurs snippets"
+            )
+            other_sample = ", ".join(record.get("external_domains_sample") or [])
+
+            severity = "warning" if intensity == "HIGH" else ("warning" if intensity == "MEDIUM" else "info")
+
             issues.append({
-                "severity": "warning",
+                "severity": severity,
                 "area": "manufacturer_dup_check",
-                "finding": f"Product description likely copied from manufacturer: {record['url']}",
+                "finding": (
+                    f"Description produit probablement copiée du constructeur — "
+                    f"intensité {intensity} ({matched}/{total} snippets matchés sur "
+                    f"{unique_count} domaines externes uniques) — {record['url']}"
+                ),
                 "evidence": (
-                    f"Quoted snippet of {len(record.get('snippet') or '')} chars found on "
-                    f"{record.get('external_domains_count')} external domains. "
-                    f"Sample: {sample_domains}"
+                    f"Domaines récurrents (≥2 snippets matchés) : {recurrent_str}. "
+                    f"Échantillon de tous les domaines détectés : {other_sample}. "
+                    f"Source du texte analysé : {record.get('text_source', '?')}."
                 ),
                 "fix": (
-                    "Rewrite this product description with unique value-add content "
-                    "(features in context, use cases, comparisons). Boilerplate manufacturer "
-                    "descriptions cap the long-tail SEO potential across the catalogue."
+                    "Réécrire la description avec un angle unique : cas d'usage, comparaison "
+                    "avec un produit voisin de votre catalogue, conseil d'installation, "
+                    "retours d'expérience client. Une fiche dupliquée plafonne mécaniquement "
+                    "le positionnement longue traîne face aux concurrents qui ré-écrivent."
                 ),
             })
         elif record.get("fetch_error"):
