@@ -43,8 +43,10 @@ from generate_report import (
 
 
 def default_html_path(url: str) -> str:
-    domain = urlparse(url).netloc.replace(".", "_")
-    return f"seo-report-{domain}.html"
+    # Option A flat naming with 02-BHUNA prefix; the file lands in the cwd
+    # (which the caller sets to audits/<domain>/) so the audit folder is
+    # self-contained.
+    return "02-BHUNA-dashboard.html"
 
 
 def write_json(path: str, payload: dict) -> str:
@@ -60,13 +62,13 @@ def write_json(path: str, payload: dict) -> str:
 def main():
     parser = argparse.ArgumentParser(description="Run SEO audit and write report artifacts")
     parser.add_argument("url", help="Website URL to audit")
-    parser.add_argument("--json", dest="json_output", default="audit-results.json",
-                        help="JSON output path (default: audit-results.json)")
-    parser.add_argument("--html", default="", help="HTML report output path")
-    parser.add_argument("--markdown", default="FULL-AUDIT-REPORT.md",
-                        help="Markdown audit output path (default: FULL-AUDIT-REPORT.md)")
-    parser.add_argument("--action-plan", default="ACTION-PLAN.md",
-                        help="Markdown action-plan output path (default: ACTION-PLAN.md)")
+    parser.add_argument("--json", dest="json_output", default="02-BHUNA-data.json",
+                        help="JSON output path (default: 02-BHUNA-data.json)")
+    parser.add_argument("--html", default="", help="HTML report output path (default: 02-BHUNA-dashboard.html)")
+    parser.add_argument("--markdown", default="02-BHUNA-rapport.md",
+                        help="Markdown audit output path (default: 02-BHUNA-rapport.md)")
+    parser.add_argument("--action-plan", default="02-BHUNA-actions.md",
+                        help="Markdown action-plan output path (default: 02-BHUNA-actions.md)")
     parser.add_argument("--no-html", action="store_true", help="Do not write the HTML dashboard")
     parser.add_argument("--no-json", action="store_true", help="Do not write JSON results")
     parser.add_argument("--no-markdown", action="store_true", help="Do not write markdown/action-plan artifacts")
