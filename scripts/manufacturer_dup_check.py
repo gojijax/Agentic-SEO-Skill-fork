@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import re
 import sys
 from urllib.parse import urlparse
@@ -120,9 +121,59 @@ def _is_ui_chrome(snippet: str) -> bool:
     return any(w in s for w in UI_GENERIC_WORDS)
 
 
-def _clean_text(soup: BeautifulSoup) -> tuple[str, str]:
+# Map a detected CMS to the subset of selectors most likely to identify its
+# long description block. When we know the CMS we try ONLY those selectors
+# first — avoids matching a foreign selector (e.g. WordPress .entry-content
+# on a PrestaShop theme that happens to include similar markup) which would
+# pick up the wrong block and produce false positives downstream.
+CMS_LONG_DESCRIPTION_PRIORITY = {
+    "PrestaShop": [
+        ".product-description",
+        "#product-description",
+        ".tab-pane#description",
+        ".product-information .product-description",
+        "[itemprop='description']",
+    ],
+    "WooCommerce": [
+        "#tab-description",
+        ".woocommerce-tabs .panel#tab-description",
+        ".woocommerce-Tabs-panel--description",
+        ".entry-content",
+        "[itemprop='description']",
+    ],
+    "Shopify": [
+        ".product__description",
+        ".product-single__description",
+        ".product-content",
+        ".rte",
+        "[itemprop='description']",
+    ],
+    "Magento": [
+        ".product.attribute.description .value",
+        "#description.value",
+        "[itemprop='description']",
+    ],
+    "Drupal": [
+        ".field--name-body",
+        ".field--name-field-description",
+        "[itemprop='description']",
+    ],
+    "WordPress": [
+        ".entry-content",
+        "#post-content",
+        "[itemprop='description']",
+    ],
+}
+
+
+def _clean_text(soup: BeautifulSoup, cms_hint: str | None = None) -> tuple[str, str]:
     """Return (text, source_selector). source_selector identifies which strategy
-    picked the text — useful to diagnose why a snippet looks weird."""
+    picked the text — useful to diagnose why a snippet looks weird.
+
+    cms_hint (e.g. "PrestaShop"): when provided, we ONLY try the selectors
+    known to match that CMS first. Only if none of them produce sufficient
+    content do we fall back to the broad LONG_DESCRIPTION_SELECTORS list.
+    """
     # 1) Strip noise tags + classes
     for tag in soup.find_all(NOISE_TAGS):
         tag.decompose()
@@ -135,7 +186,25 @@ def _clean_text(soup: BeautifulSoup) -> tuple[str, str]:
                 tag.decompose()
         except Exception:
             continue
-    # 3) Prefer CMS-aware long-description selectors
+
+    # 3a) CMS-prioritised selectors (when CMS is known and recognised)
+    if cms_hint:
+        # Hybrid label like "PrestaShop + WooCommerce (hybride)" → keep first token
+        primary = cms_hint.split(" +")[0].split(" (")[0].strip()
+        cms_selectors = CMS_LONG_DESCRIPTION_PRIORITY.get(primary)
+        if cms_selectors:
+            for sel in cms_selectors:
+                try:
+                    zone = soup.select_one(sel)
+                except Exception:
+                    continue
+                if zone:
+                    text = zone.get_text(separator=" ", strip=True)
+                    if len(text) > 100:
+                        return re.sub(r"\s+", " ", text), f"cms[{primary}]:{sel}"
+
+    # 3b) Broad CMS-aware long-description selectors (CMS unknown or
+    # CMS-specific selectors didn't match)
     for sel in LONG_DESCRIPTION_SELECTORS:
         try:
             zone = soup.select_one(sel)
@@ -207,7 +276,7 @@ def _extract_snippets(text: str, snippet_len: int, max_candidates: int = 3) -> l
     ]
 
 
-def _fetch_snippet(url: str, snippet_len: int, timeout: int = 12) -> dict:
+def _fetch_snippet(url: str, snippet_len: int, timeout: int = 12, cms_hint: str | None = None) -> dict:
     out = {"url": url, "snippet": None, "fetch_error": None}
     try:
         resp = safe_get(url, timeout=timeout, headers=default_headers())
@@ -232,7 +301,7 @@ def _fetch_snippet(url: str, snippet_len: int, timeout: int = 12) -> dict:
     else:
         html_text = resp.text
     soup = BeautifulSoup(html_text, "html.parser")
-    text, source = _clean_text(soup)
+    text, source = _clean_text(soup, cms_hint=cms_hint)
     snippets = _extract_snippets(text, snippet_len)
     if not snippets or all(len(s) < 60 for s in snippets):
         out["fetch_error"] = f"main content too short ({len(text)} chars from {source})"
@@ -313,6 +382,25 @@ def run(urls_file: str, max_urls: int, snippet_len: int, threshold: int,
         return {"error": f"could not read urls file: {exc}", "checked": []}
 
     audited_domain = (urls_meta.get("domain") or "").lower().lstrip("www.")
+
+    # Look up the CMS detected at scraping time. Try urls.json's own
+    # cms_detected field first, then the sibling scraping.json / output.json
+    # produced by the audit-prospect-ecommerce scraper.py.
+    cms_hint: str | None = urls_meta.get("cms_detected") or None
+    if not cms_hint:
+        urls_dir = os.path.dirname(os.path.abspath(urls_file))
+        for sibling in ("01-ECOM-scraping.json", "scraping.json", "output.json"):
+            sibling_path = os.path.join(urls_dir, sibling)
+            if os.path.exists(sibling_path):
+                try:
+                    with open(sibling_path, "r", encoding="utf-8") as f:
+                        scraping = json.load(f)
+                    candidate = scraping.get("cms") or scraping.get("cms_detected")
+                    if candidate and candidate != "Autre" and candidate != "Non détecté":
+                        cms_hint = candidate
+                        break
+                except (OSError, json.JSONDecodeError):
+                    continue
     if not audited_domain:
         # Fallback: derive from the first URL.
         for entry in urls_meta.get("urls", []):
@@ -332,7 +420,7 @@ def run(urls_file: str, max_urls: int, snippet_len: int, threshold: int,
     suspect_count = 0
     for entry in products:
         url = entry["url"]
-        page = _fetch_snippet(url, snippet_len, timeout=timeout)
+        page = _fetch_snippet(url, snippet_len, timeout=timeout, cms_hint=cms_hint)
         snippets_tried = page.get("snippets") or ([page["snippet"]] if page.get("snippet") else [])
         record = {
             "url": url,
