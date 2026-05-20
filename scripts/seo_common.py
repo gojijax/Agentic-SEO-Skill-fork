@@ -334,16 +334,27 @@ def discover_sitemap_urls(site_url: str, timeout: int = 15) -> list[str]:
     if robots.get("parsed"):
         candidates.extend(robots["parsed"].get("sitemaps", []))
     candidates.extend([
+        # Standards (à tester en premier — couvrent Shopify, Wix, Squarespace,
+        # Webflow, HubSpot, Yoast SEO, Rank Math, All in One SEO, Drupal XML
+        # Sitemap, Joomla OSMap/JSitemap)
         base + "/sitemap.xml",
         base + "/sitemap_index.xml",
         base + "/sitemap-index.xml",
-        # PrestaShop module Google Sitemap typical pattern: /<shop_id>_index_sitemap.xml
+        base + "/sitemap.xml.gz",
+        base + "/sitemap1.xml",
+        base + "/index_sitemap.xml",
+        # PrestaShop module Google Sitemap : /<shop_id>_index_sitemap.xml
+        # et le fichier de pages auquel l'index pointe en général
         base + "/1_index_sitemap.xml",
         base + "/2_index_sitemap.xml",
-        # WordPress / Yoast / RankMath
+        base + "/1_fr_0_sitemap.xml",
+        # WordPress 5.5+ natif
         base + "/wp-sitemap.xml",
-        # Magento default
+        # Magento / Adobe Commerce
         base + "/pub/sitemap.xml",
+        # Ghost (index + children, mais l'index suffit normalement)
+        base + "/sitemap-pages.xml",
+        base + "/sitemap-posts.xml",
     ])
     seen = set()
     output = []
