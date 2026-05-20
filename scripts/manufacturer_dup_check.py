@@ -115,6 +115,33 @@ DEFAULT_MAX_URLS = 5
 DEFAULT_THRESHOLD = 5
 PRODUCT_TYPES = {"product_strong", "product_weak", "product"}
 
+# Domaines à exclure des résultats SERP : CDN d'images, comparateurs, agrégateurs
+# qui matchent par hasard (images de produits indexées Google, snippets de
+# fragments très courts). Ces matches ne sont pas des vraies pages de
+# description concurrente.
+EXCLUDED_DOMAINS = {
+    # CDN images e-commerce
+    "scene7.com", "boulanger.scene7.com", "media.adeo.com",
+    "i.pinimg.com", "pinterest.com", "pinterest.fr",
+    "cdn.shopify.com", "shopifycdn.com",
+    # Réseaux sociaux qui apparaissent souvent
+    "facebook.com", "instagram.com", "youtube.com", "youtu.be",
+    "twitter.com", "x.com", "linkedin.com", "tiktok.com",
+    # Comparateurs / portails qui agrègent sans copier
+    "google.com", "google.fr",
+}
+
+
+def _is_excluded_domain(domain: str) -> bool:
+    """True if a domain should be ignored in the duplicate analysis (CDN, social, etc.)."""
+    if not domain:
+        return True
+    d = domain.lower().lstrip("www.")
+    if d in EXCLUDED_DOMAINS:
+        return True
+    # Match suffixes too (e.g. random.scene7.com)
+    return any(d.endswith("." + x) or d == x for x in EXCLUDED_DOMAINS)
+
 
 def _is_ui_chrome(snippet: str) -> bool:
     s = snippet.lower()
@@ -357,6 +384,8 @@ def _parse_serp_response(payload: dict, audited_domain: str) -> dict:
             domain = (item.get("domain") or "").lower().lstrip("www.")
             if not domain or domain == audited_domain:
                 continue
+            if _is_excluded_domain(domain):
+                continue
             domain_counts[domain] = domain_counts.get(domain, 0) + 1
         result["domains"] = sorted(domain_counts.keys())
         result["total_results"] = sum(domain_counts.values())
@@ -494,10 +523,17 @@ def run(urls_file: str, max_urls: int, snippet_len: int, threshold: int,
             record["intensity"] = intensity
             record["serp_status"] = "; ".join(statuses)
 
-            # Suspect if either total unique domains crosses threshold OR
-            # intensity is MEDIUM/HIGH (which is independent of threshold).
-            if total_unique >= threshold or intensity in ("MEDIUM", "HIGH"):
-                record["manufacturer_copy_suspect"] = True
+            # SUSPECT requires recurrent domains. A domain matched on a single
+            # snippet is almost always noise — a generic phrase or product name
+            # that happens to be shared. Real duplication is when the SAME
+            # domain matches across 2+ snippets — that means it carries enough
+            # of our text to be considered copied (or copying us).
+            #
+            # Total unique count alone is unreliable: tested on BSD with 17
+            # unique single-hit domains (all noise, 0 recurrent) → would have
+            # been a false positive. Switched to recurrent-only signal.
+            record["manufacturer_copy_suspect"] = len(recurrent) > 0
+            if record["manufacturer_copy_suspect"]:
                 suspect_count += 1
         checked.append(record)
 
@@ -510,33 +546,42 @@ def run(urls_file: str, max_urls: int, snippet_len: int, threshold: int,
             recurrent = record.get("recurrent_domains") or []
             unique_count = record.get("external_domains_count", 0)
 
-            # Recurrent domains are the strongest signal — list them first
-            recurrent_str = (
-                ", ".join(f"{r['domain']} ({r['matched_snippets']} snippets)" for r in recurrent[:5])
-                if recurrent else "aucun domaine ne matche sur plusieurs snippets"
+            recurrent_str = ", ".join(
+                f"{r['domain']} ({r['matched_snippets']} snippets)" for r in recurrent[:5]
             )
             other_sample = ", ".join(record.get("external_domains_sample") or [])
 
-            severity = "warning" if intensity == "HIGH" else ("warning" if intensity == "MEDIUM" else "info")
+            # Recurrent count drives the severity. Single recurrent on 2 of 3
+            # snippets is a clear shared-text signal — warning. 2+ recurrent
+            # is overwhelming evidence of broad sharing — still warning, but
+            # with stronger wording in the finding.
+            severity = "warning"
+            many_recurrent = len(recurrent) >= 2
 
             issues.append({
                 "severity": severity,
                 "area": "manufacturer_dup_check",
                 "finding": (
-                    f"Description produit probablement copiée du constructeur — "
-                    f"intensité {intensity} ({matched}/{total} snippets matchés sur "
-                    f"{unique_count} domaines externes uniques) — {record['url']}"
+                    f"Texte de la description partagé avec {len(recurrent)} domaine(s) récurrent(s) "
+                    f"(intensité {intensity}, {matched}/{total} snippets matchés) — {record['url']}"
                 ),
                 "evidence": (
-                    f"Domaines récurrents (≥2 snippets matchés) : {recurrent_str}. "
-                    f"Échantillon de tous les domaines détectés : {other_sample}. "
+                    f"Domaines récurrents (mêmes textes retrouvés sur 2+ snippets) : {recurrent_str}. "
+                    f"Échantillon des domaines à snippet unique : {other_sample[:200]}. "
                     f"Source du texte analysé : {record.get('text_source', '?')}."
                 ),
                 "fix": (
-                    "Réécrire la description avec un angle unique : cas d'usage, comparaison "
-                    "avec un produit voisin de votre catalogue, conseil d'installation, "
-                    "retours d'expérience client. Une fiche dupliquée plafonne mécaniquement "
-                    "le positionnement longue traîne face aux concurrents qui ré-écrivent."
+                    "Vérifier la **direction de la copie** avant de conclure. Deux scénarios :\n"
+                    "(1) Le texte vient du constructeur et a été repris tel quel par "
+                    "plusieurs revendeurs (vous inclus) → réécrire avec un angle unique "
+                    "(cas d'usage, comparaison, conseil installation, retour client).\n"
+                    "(2) Votre site est l'original et d'autres copient (scrapers, "
+                    "aggregators, comparateurs) → pas d'action SEO directe, mais "
+                    "envisager une demande de retrait pour les sites manifestement "
+                    "frauduleux. Si le domaine récurrent est très peu connu, c'est "
+                    "souvent ce cas.\n"
+                    "Pour trancher : ouvrir l'URL d'un domaine récurrent et comparer "
+                    "le contenu mot à mot avec votre fiche."
                 ),
             })
         elif record.get("fetch_error"):
