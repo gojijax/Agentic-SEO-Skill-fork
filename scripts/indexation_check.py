@@ -115,8 +115,15 @@ def _count_sitemap_urls(domain: str, timeout: int = 15, max_sitemaps: int = 25) 
                 queue.append(child["loc"])
         else:
             errors.append(f"{sm} -> unsupported sitemap type")
+    # "found" = at least one sitemap returned 200 AND parsed to a urlset/sitemapindex.
+    # Candidate URLs that all 404 don't count.
+    found_real = len(urls) > 0 or any(
+        "-> HTTP 200" not in e and "-> HTTP" not in e for e in errors
+    )
+    # Simpler: found is True iff we actually parsed at least one urlset
+    found_real = len(urls) > 0
     return {
-        "found": True,
+        "found": found_real,
         "total_urls": len(urls),
         "sitemaps_seen": list(seen_sitemaps),
         "errors": errors,
@@ -183,6 +190,25 @@ def run(domain: str, haloscan_path: str | None, gap_threshold: float) -> dict:
             "fix": "Check DataForSEO credentials and retry. Without this signal the indexation gap cannot be measured.",
         })
     else:
+        # Sitemap missing entirely while Google has indexed pages = important SEO gap
+        if not sitemap_info.get("found"):
+            issues.append({
+                "severity": "warning",
+                "area": "indexation_check",
+                "finding": f"Aucun sitemap.xml exposé alors que Google a indexé environ {google_count} pages",
+                "evidence": (
+                    f"Aucune des URLs candidates (/sitemap.xml, /sitemap_index.xml, etc.) ne répond. "
+                    f"Aucune directive `Sitemap:` détectable dans robots.txt. "
+                    f"Google a néanmoins indexé ~{google_count} pages, donc le site est crawlé via "
+                    f"d'autres signaux (liens internes/externes)."
+                ),
+                "fix": (
+                    "Créer un sitemap.xml exposé à la racine (PrestaShop : module 'Google sitemap'). "
+                    "Ajouter la directive Sitemap dans robots.txt. Soumettre le sitemap dans Search "
+                    "Console une fois en place pour accélérer la découverte des pages."
+                ),
+            })
+
         # Compare to sitemap if available
         if sitemap_count and sitemap_count > 0:
             gap = (sitemap_count - google_count) / sitemap_count
