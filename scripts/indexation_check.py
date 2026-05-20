@@ -70,6 +70,12 @@ def _query_google_index(domain: str, login: str, password: str, timeout: int = 3
     }]
     resp = safe_post(DATAFORSEO_ENDPOINT, headers=headers, json=body, timeout=timeout)
     payload = resp.json()
+    top_code = payload.get("status_code")
+    if resp.status_code >= 400 or (isinstance(top_code, int) and top_code >= 40000):
+        return {
+            "approx_count": None,
+            "raw_status": f"HTTP {resp.status_code} / status_code {top_code}: {payload.get('status_message')}",
+        }
     tasks = payload.get("tasks") or []
     if not tasks:
         return {"approx_count": None, "raw_status": payload.get("status_message")}

@@ -132,7 +132,14 @@ def _dataforseo_serp(snippet: str, login: str, password: str, timeout: int = 30)
         "device": "desktop",
     }]
     resp = safe_post(DATAFORSEO_ENDPOINT, headers=headers, json=body, timeout=timeout)
-    return resp.json()
+    payload = resp.json()
+    top_code = payload.get("status_code")
+    if resp.status_code >= 400 or (isinstance(top_code, int) and top_code >= 40000):
+        raise RuntimeError(
+            f"DataForSEO HTTP {resp.status_code} / status_code {top_code}: "
+            f"{payload.get('status_message')}"
+        )
+    return payload
 
 
 def _parse_serp_response(payload: dict, audited_domain: str) -> dict:
