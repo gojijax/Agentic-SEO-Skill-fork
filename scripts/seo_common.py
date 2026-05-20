@@ -333,7 +333,18 @@ def discover_sitemap_urls(site_url: str, timeout: int = 15) -> list[str]:
     robots = fetch_robots(site_url, timeout=timeout)
     if robots.get("parsed"):
         candidates.extend(robots["parsed"].get("sitemaps", []))
-    candidates.extend([base + "/sitemap.xml", base + "/sitemap_index.xml", base + "/sitemap-index.xml"])
+    candidates.extend([
+        base + "/sitemap.xml",
+        base + "/sitemap_index.xml",
+        base + "/sitemap-index.xml",
+        # PrestaShop module Google Sitemap typical pattern: /<shop_id>_index_sitemap.xml
+        base + "/1_index_sitemap.xml",
+        base + "/2_index_sitemap.xml",
+        # WordPress / Yoast / RankMath
+        base + "/wp-sitemap.xml",
+        # Magento default
+        base + "/pub/sitemap.xml",
+    ])
     seen = set()
     output = []
     for candidate in candidates:

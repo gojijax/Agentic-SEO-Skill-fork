@@ -55,11 +55,27 @@ NOISE_TAGS = ("nav", "header", "footer", "aside", "script", "style", "noscript")
 NOISE_CLASSES = (
     "breadcrumb", "menu", "sidebar", "footer", "header", "nav", "cookie",
     "newsletter", "product-list", "related-products", "reviews",
+    # E-commerce UI chrome that pollutes the snippet:
+    "cart", "panier", "minicart", "mini-cart", "basket", "checkout",
+    "account", "compte", "search-bar", "search", "login", "register",
+    "popup", "modal", "overlay", "toolbar", "loader", "loading", "spinner",
 )
+# UI words that, if present in a snippet, mean it's most likely cart/account
+# chrome rather than product description. A snippet with any of these is rejected.
+UI_GENERIC_WORDS = {
+    "panier", "sous-total", "loading", "continuer mes achats", "voir mon panier",
+    "ajouter au panier", "newsletter", "code promo", "mon compte", "se connecter",
+    "créer un compte", "mot de passe", "adresse email", "loading",
+}
 DEFAULT_SNIPPET_LEN = 180
 DEFAULT_MAX_URLS = 5
 DEFAULT_THRESHOLD = 5
 PRODUCT_TYPES = {"product_strong", "product_weak", "product"}
+
+
+def _is_ui_chrome(snippet: str) -> bool:
+    s = snippet.lower()
+    return any(w in s for w in UI_GENERIC_WORDS)
 
 
 def _clean_text(soup: BeautifulSoup) -> str:
@@ -79,21 +95,49 @@ def _clean_text(soup: BeautifulSoup) -> str:
     return ""
 
 
-def _extract_snippet(text: str, snippet_len: int) -> str:
-    """Pull a distinctive ~snippet_len-char window from the middle of the text."""
-    if not text or len(text) < snippet_len + 40:
-        return text.strip()
-    start = max(40, (len(text) - snippet_len) // 2)
-    while start < len(text) and text[start] != " ":
-        start += 1
-    start += 1
-    end = min(len(text), start + snippet_len)
-    while end > start and text[end - 1] != " ":
-        end -= 1
-    snippet = text[start:end].strip()
-    snippet = re.sub(r"[\"“”‘’]", " ", snippet)
-    snippet = re.sub(r"\s+", " ", snippet).strip()
-    return snippet
+def _extract_snippets(text: str, snippet_len: int, max_candidates: int = 3) -> list[str]:
+    """Return up to N distinct sentence-snippets to cross-check against Google.
+
+    A single snippet can miss a duplicated page if it falls on a less-quoted
+    sentence. Three snippets distributed across the content (start / middle /
+    end) catch most manufacturer-boilerplate cases.
+    """
+    if not text:
+        return []
+    cleaned = re.sub(r"[\"“”‘’]", " ", text)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if len(cleaned) < 60:
+        return [cleaned] if cleaned else []
+
+    sentences = re.split(r"(?<=[.!?])\s+", cleaned)
+    candidates: list[str] = []
+    for s in sentences:
+        s = s.strip().rstrip(".!?").strip()
+        if 60 <= len(s) <= snippet_len and not _is_ui_chrome(s):
+            words = re.findall(r"\b\w{3,}\b", s.lower())
+            if len(set(words)) >= 8:
+                candidates.append(s)
+    if not candidates:
+        # Fallback to mid-text crop
+        if len(cleaned) >= snippet_len + 40:
+            start = max(40, (len(cleaned) - snippet_len) // 2)
+            while start < len(cleaned) and cleaned[start] != " ":
+                start += 1
+            start += 1
+            end = min(len(cleaned), start + snippet_len)
+            while end > start and cleaned[end - 1] != " ":
+                end -= 1
+            return [cleaned[start:end].strip()]
+        return [cleaned[:snippet_len].strip()]
+
+    if len(candidates) <= max_candidates:
+        return candidates
+    # Pick start / middle / end to spread coverage
+    return [
+        candidates[0],
+        candidates[len(candidates) // 2],
+        candidates[-1],
+    ]
 
 
 def _fetch_snippet(url: str, snippet_len: int, timeout: int = 12) -> dict:
@@ -107,13 +151,27 @@ def _fetch_snippet(url: str, snippet_len: int, timeout: int = 12) -> dict:
     if "html" not in ctype.lower():
         out["fetch_error"] = f"non-html content-type: {ctype}"
         return out
-    soup = BeautifulSoup(resp.text, "html.parser")
+    # Encoding: requests guesses from headers, but many sites send no charset or
+    # the wrong one, producing mojibake like "Ã©" (UTF-8 read as Latin-1).
+    # Use apparent_encoding (chardet) when the declared encoding is the
+    # suspicious ISO-8859-1 default OR when accented chars look broken.
+    declared = (resp.encoding or "").lower()
+    raw_bytes = resp.content
+    if declared in ("iso-8859-1", "latin-1", "latin1", "") or b"\xc3\x83" in raw_bytes[:5000]:
+        try:
+            html_text = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            html_text = resp.text
+    else:
+        html_text = resp.text
+    soup = BeautifulSoup(html_text, "html.parser")
     text = _clean_text(soup)
-    snippet = _extract_snippet(text, snippet_len)
-    if not snippet or len(snippet) < 60:
+    snippets = _extract_snippets(text, snippet_len)
+    if not snippets or all(len(s) < 60 for s in snippets):
         out["fetch_error"] = "main content too short to extract a distinctive snippet"
         return out
-    out["snippet"] = snippet
+    out["snippets"] = snippets
+    out["snippet"] = snippets[0]  # backward compat
     return out
 
 
@@ -205,28 +263,46 @@ def run(urls_file: str, max_urls: int, snippet_len: int, threshold: int,
     for entry in products:
         url = entry["url"]
         page = _fetch_snippet(url, snippet_len, timeout=timeout)
+        snippets_tried = page.get("snippets") or ([page["snippet"]] if page.get("snippet") else [])
         record = {
             "url": url,
             "type": entry.get("type"),
-            "snippet": page.get("snippet"),
+            "snippet": page.get("snippet"),  # the primary one shown in report
+            "snippets_tried": snippets_tried,
             "fetch_error": page.get("fetch_error"),
             "external_domains_count": None,
             "external_domains_sample": [],
             "manufacturer_copy_suspect": False,
             "serp_status": None,
+            "per_snippet_results": [],
         }
-        if page.get("snippet"):
-            try:
-                response = _dataforseo_serp(page["snippet"], login, password)
-                parsed = _parse_serp_response(response, audited_domain)
-                record["external_domains_count"] = len(parsed["domains"])
-                record["external_domains_sample"] = parsed["domains"][:10]
-                record["serp_status"] = parsed["raw_status"]
-                if record["external_domains_count"] >= threshold:
-                    record["manufacturer_copy_suspect"] = True
-                    suspect_count += 1
-            except Exception as exc:
-                record["serp_status"] = f"request failed: {exc}"
+        if snippets_tried:
+            # Union the unique external domains across all snippet queries
+            all_domains: set[str] = set()
+            statuses = []
+            for snip in snippets_tried:
+                try:
+                    response = _dataforseo_serp(snip, login, password)
+                    parsed = _parse_serp_response(response, audited_domain)
+                    all_domains.update(parsed["domains"])
+                    statuses.append(parsed["raw_status"] or "ok")
+                    record["per_snippet_results"].append({
+                        "snippet": snip[:80],
+                        "domains_count": len(parsed["domains"]),
+                        "sample_domains": parsed["domains"][:5],
+                    })
+                except Exception as exc:
+                    statuses.append(f"request failed: {exc}")
+                    record["per_snippet_results"].append({
+                        "snippet": snip[:80],
+                        "error": str(exc),
+                    })
+            record["external_domains_count"] = len(all_domains)
+            record["external_domains_sample"] = sorted(all_domains)[:10]
+            record["serp_status"] = "; ".join(statuses)
+            if record["external_domains_count"] >= threshold:
+                record["manufacturer_copy_suspect"] = True
+                suspect_count += 1
         checked.append(record)
 
     issues: list[dict] = []
