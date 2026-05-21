@@ -269,14 +269,17 @@ def _extract_snippets(text: str, snippet_len: int, max_candidates: int = 3) -> l
         return []
     cleaned = re.sub(r"[\"“”‘’]", " ", text)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    if len(cleaned) < 60:
+    if len(cleaned) < 120:
         return [cleaned] if cleaned else []
 
     sentences = re.split(r"(?<=[.!?])\s+", cleaned)
     candidates: list[str] = []
+    # Min 120 chars: shorter snippets generate too much SERP noise (generic
+    # phrases match dozens of unrelated sites). A 120-char sentence is
+    # distinctive enough that an exact-match SERP hit is meaningful.
     for s in sentences:
         s = s.strip().rstrip(".!?").strip()
-        if 60 <= len(s) <= snippet_len and not _is_ui_chrome(s):
+        if 120 <= len(s) <= snippet_len and not _is_ui_chrome(s):
             words = re.findall(r"\b\w{3,}\b", s.lower())
             if len(set(words)) >= 8:
                 candidates.append(s)
@@ -562,25 +565,28 @@ def run(urls_file: str, max_urls: int, snippet_len: int, threshold: int,
                 "severity": severity,
                 "area": "manufacturer_dup_check",
                 "finding": (
-                    f"Texte de la description partagé avec {len(recurrent)} domaine(s) récurrent(s) "
-                    f"(intensité {intensity}, {matched}/{total} snippets matchés) — {record['url']}"
+                    f"Description produit : {unique_count} domaine(s) tiers reprennent au moins "
+                    f"une phrase de votre fiche. Parmi eux, {len(recurrent)} domaine(s) "
+                    f"récurrent(s) partagent ≥2 phrases distinctes — signal robuste de "
+                    f"duplication. URL : {record['url']}"
                 ),
                 "evidence": (
-                    f"Domaines récurrents (mêmes textes retrouvés sur 2+ snippets) : {recurrent_str}. "
-                    f"Échantillon des domaines à snippet unique : {other_sample[:200]}. "
+                    f"Domaines récurrents : {recurrent_str}. "
+                    f"Échantillon des autres domaines (1 phrase commune) : {other_sample[:200]}. "
+                    f"Intensité {intensity} ({matched}/{total} snippets matchés). "
                     f"Source du texte analysé : {record.get('text_source', '?')}."
                 ),
                 "fix": (
-                    "Vérifier la **direction de la copie** avant de conclure. Deux scénarios :\n"
-                    "(1) Le texte vient du constructeur et a été repris tel quel par "
-                    "plusieurs revendeurs (vous inclus) → réécrire avec un angle unique "
-                    "(cas d'usage, comparaison, conseil installation, retour client).\n"
-                    "(2) Votre site est l'original et d'autres copient (scrapers, "
-                    "aggregators, comparateurs) → pas d'action SEO directe, mais "
-                    "envisager une demande de retrait pour les sites manifestement "
-                    "frauduleux. Si le domaine récurrent est très peu connu, c'est "
-                    "souvent ce cas.\n"
-                    "Pour trancher : ouvrir l'URL d'un domaine récurrent et comparer "
+                    "Deux interprétations possibles :\n"
+                    "(a) Vous avez repris la description d'origine (fabricant, distributeur "
+                    "officiel, autre revendeur). Dans ce cas, réécrire avec un angle unique "
+                    "apporte un avantage SEO : cas d'usage, comparaison, conseil installation, "
+                    "retour client.\n"
+                    "(b) Un site externe a copié votre contenu. Vous pouvez demander le retrait "
+                    "par email au webmaster du site copieur. Si la copie est manifeste et le "
+                    "site ne répond pas, signalement DMCA ou formulaire Google « Contenu "
+                    "dupliqué ». Pas d'autre action SEO directe.\n"
+                    "Méthode pour trancher : ouvrir l'URL d'un domaine récurrent et comparer "
                     "le contenu mot à mot avec votre fiche."
                 ),
             })
