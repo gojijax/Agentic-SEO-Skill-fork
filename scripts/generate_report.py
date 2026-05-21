@@ -595,10 +595,18 @@ def collect_data(url: str, urls_file: str | None = None) -> dict:
     indexation_domain = urlparse(url).netloc.lstrip("www.")
     analyses.append(("indexation", "indexation_check.py", ["--domain", indexation_domain]))
 
+    # Per-script timeout overrides. PageSpeed peut dépasser le default de 120s
+    # sur des sites lourds : l'API Google PSI met parfois > 60s à répondre, et
+    # pagespeed.py retry jusqu'à 3 fois avec backoff. Sans override, le kill
+    # subprocess survient avant la 2e tentative.
+    SCRIPT_TIMEOUTS = {
+        "pagespeed.py": 300,
+    }
     for name, script, args in analyses:
         print(f"  ⏳ Running {script}...")
         start = time.time()
-        result = run_script(script, args)
+        script_timeout = SCRIPT_TIMEOUTS.get(script, 120)
+        result = run_script(script, args, timeout=script_timeout)
         elapsed = round(time.time() - start, 1)
         data["sections"][name] = result
         status = "⚠️ error" if "error" in result and result.get("error") else "✅"
