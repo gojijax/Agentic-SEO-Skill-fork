@@ -2141,6 +2141,14 @@ def main():
                         help="Markdown action-plan output path (default: ACTION-PLAN.md)")
     parser.add_argument("--no-html", action="store_true", help="Do not write the HTML dashboard")
     parser.add_argument("--no-markdown", action="store_true", help="Do not write markdown/action-plan artifacts")
+    parser.add_argument("--actions-json", default="02-BHUNA-actions.json",
+                        help="Path for the canonical actions JSON (default: 02-BHUNA-actions.json)")
+    parser.add_argument("--no-canonical-actions", action="store_true",
+                        help="Skip generation of the canonical actions JSON+MD pair")
+    parser.add_argument("--client-name", default=None,
+                        help="Override the auto-detected client/brand name in the actions meta")
+    parser.add_argument("--audit-date", default=None,
+                        help="Override audit date (YYYY-MM-DD). Default: today.")
 
     args = parser.parse_args()
     scoring_config = load_scoring_config()
@@ -2171,6 +2179,37 @@ def main():
         action_plan = render_action_plan(data, scores)
         written.append(("Full audit report", write_text_output(args.markdown, markdown)))
         written.append(("Action plan", write_text_output(args.action_plan, action_plan)))
+
+    if not args.no_canonical_actions:
+        # Canonical JSON + MD actions, conforming to seo_skills action.schema.json.
+        # Consumed downstream by seo-action-tracker (consolidator) and notion-roadmap-builder.
+        try:
+            from seo_skills.bhuna_actions_builder import build_bhuna_actions, write_actions_files
+            from datetime import date
+            findings = collect_report_findings(data)
+            audit_date = args.audit_date or date.today().isoformat()
+            actions_data = build_bhuna_actions(
+                findings=findings,
+                data=data,
+                scores=scores,
+                audit_date=audit_date,
+                client_name=args.client_name,
+            )
+            json_out_path = os.path.abspath(args.actions_json)
+            output_dir = os.path.dirname(json_out_path) or "."
+            # The builder writes both .json and .md side by side. Honour the
+            # filename of --actions-json by overriding the JSON path.
+            json_path, md_path = write_actions_files(actions_data, output_dir)
+            if os.path.abspath(str(json_path)) != json_out_path:
+                # Caller asked for a custom JSON name; rename in place.
+                os.replace(str(json_path), json_out_path)
+                json_path = json_out_path
+            written.append(("Canonical actions JSON", str(json_path)))
+            written.append(("Canonical actions MD", str(md_path)))
+        except ImportError:
+            print("  Skipped canonical actions (seo_skills not installed: pip install -e <repo>)")
+        except Exception as exc:
+            print(f"  Skipped canonical actions due to error: {exc}")
 
     print("\nReport artifacts:")
     for label, path in written:
