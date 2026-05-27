@@ -35,6 +35,55 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(SCRIPT_DIR)
 SCORING_CONFIG_PATH = os.path.join(ROOT_DIR, "resources", "config", "scoring.json")
 
+# Mode business-focused : whitelist des scripts a lancer. Les autres sont
+# skippes pour gagner 30-50% du temps d'audit (leurs findings seraient
+# de toute facon filtres en aval cote seo-skills-custom par
+# _filter_actions_business_focused). Active via BHUNA_MODE=business
+# dans l'env. Defaut = "complet" = tous les scripts.
+#
+# Source : alignement avec la whitelist business-focused cote
+# bhuna_actions_builder.py (Contenu + Maillage interne + Technique
+# limite a "Balises et structure des pages" et "Originalite des contenus").
+BUSINESS_FOCUSED_SCRIPT_WHITELIST = {
+    # Contenu - Balises et structure des pages
+    "onpage",            # parse_html.py
+    "canonical",         # canonical_checker.py
+    "image_inventory",   # image_inventory.py (alt texts)
+    "product_schema",    # product_schema_checker.py
+    "article",           # article_seo.py
+    # Contenu - Lisibilite / Originalite
+    "duplicate_content", # duplicate_content.py
+    "readability",       # readability.py
+    "freshness",         # freshness_checker.py
+    # Maillage interne
+    "internal_links",    # internal_links.py
+    "link_profile",      # link_profile.py
+    # manufacturer_dup_check est lance en dehors de la liste analyses
+    # (bloc dedie en mode hybride) et reste actif en business-focused.
+}
+
+
+def _filter_analyses_for_business_mode(analyses: list) -> list:
+    """En mode BHUNA_MODE=business, ne garde que les analyses dont le
+    nom de base (avant ':') est dans BUSINESS_FOCUSED_SCRIPT_WHITELIST.
+
+    Les keys per-URL ont la forme 'script_name:https://...' : on extrait
+    le prefixe pour la lookup. Ex : 'image_inventory:https://example.com/x'
+    -> base 'image_inventory' -> garde si 'image_inventory' est whitelisted."""
+    kept = []
+    for entry in analyses:
+        key = entry[0] if entry else ""
+        base = key.split(":", 1)[0] if isinstance(key, str) else ""
+        if base in BUSINESS_FOCUSED_SCRIPT_WHITELIST:
+            kept.append(entry)
+    return kept
+
+
+def _bhuna_mode() -> str:
+    """Retourne le mode d'audit BHUNA. Defaut 'complet' (tous les scripts).
+    'business' active la whitelist BUSINESS_FOCUSED_SCRIPT_WHITELIST."""
+    return os.environ.get("BHUNA_MODE", "complet").strip().lower()
+
 try:
     from lib.safe_http import safe_get
 except ImportError:
@@ -435,6 +484,14 @@ def _run_per_page_analyses(url: str, ptype: str) -> dict:
     if per_page_html and os.path.exists(per_page_html):
         analyses.append(("onpage", "parse_html.py", [per_page_html, "--url", url]))
         analyses.append(("readability", "readability.py", [per_page_html]))
+
+    # Mode business-focused : filtre la liste pour ne garder que ce qui
+    # remontera dans la roadmap finale. Sur cette fonction per-page, on
+    # garde typiquement onpage / readability / article (Contenu) et on
+    # skip social / redirects / entity / hreflang.
+    if _bhuna_mode() == "business":
+        analyses = _filter_analyses_for_business_mode(analyses)
+
     for name, script, args in analyses:
         start = time.time()
         result = run_script(script, args)
@@ -594,6 +651,20 @@ def collect_data(url: str, urls_file: str | None = None) -> dict:
     # Skips automatically if DataForSEO creds are missing.
     indexation_domain = urlparse(url).netloc.lstrip("www.")
     analyses.append(("indexation", "indexation_check.py", ["--domain", indexation_domain]))
+
+    # Mode business-focused : applique la whitelist BUSINESS_FOCUSED_SCRIPT_WHITELIST
+    # AVANT la boucle d'execution. Skip silencieusement les scripts dont
+    # les findings seraient filtres en aval (cf. _filter_actions_business_focused
+    # cote seo-skills-custom). Economise 30-50% du temps d'audit.
+    mode = _bhuna_mode()
+    if mode == "business":
+        n_before = len(analyses)
+        analyses = _filter_analyses_for_business_mode(analyses)
+        n_after = len(analyses)
+        print(
+            f"\n  [BHUNA_MODE=business] Skippe {n_before - n_after} script(s) "
+            f"hors whitelist business-focused. Reste {n_after} script(s) actif(s).\n"
+        )
 
     # Per-script timeout overrides. PageSpeed peut dépasser le default de 120s
     # sur des sites lourds : l'API Google PSI met parfois > 60s à répondre, et
