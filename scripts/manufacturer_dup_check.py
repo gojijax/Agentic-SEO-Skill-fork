@@ -369,29 +369,183 @@ def _dataforseo_serp(snippet: str, login: str, password: str, timeout: int = 30)
     return payload
 
 
+# --- Niveau 2 : validation HTML brut (refonte 29/05/2026) ---
+#
+# DataForSEO SERP est un endpoint de tracking, pas de detection de duplication.
+# Google tolere les guillemets sur les phrases longues (>= 60 chars) et renvoie
+# des resultats semantiquement proches sans la phrase exacte. Sur BSD le 29/05,
+# 12 domaines "tiers" remontes par BHUNA ont tous ete invalides au check Google
+# manuel. Le script comptait des faux positifs.
+#
+# Solution adoptee : N1 (DataForSEO) reste un candidate filter. N2 (ce bloc)
+# fetch le HTML de chaque candidat et verifie litteralement que la phrase
+# apparait dans le texte rendu. Cache par URL pour amortir.
+
+_WHITESPACE_RE = re.compile(r"\s+")
+# Caracteres unicode "fancy" qui cassent un match exact entre l'export HTML
+# d'un site (guillemets typographiques, apostrophes courbes, tirets cadratins)
+# et la version brute du snippet. Tous normalises vers leur equivalent ASCII.
+_FANCY_PUNCT_MAP = str.maketrans({
+    "‘": "'", "’": "'",  # apostrophes courbes
+    "“": '"', "”": '"',  # guillemets typographiques
+    "«": '"', "»": '"',  # guillemets francais
+    "–": "-", "—": "-",  # tirets demi/cadratin
+    "…": "...",                # ellipsis
+    " ": " ",                  # nbsp
+})
+
+
+def _normalize_for_match(text: str) -> str:
+    """Lowercase + ASCII-fy fancy punctuation + collapse whitespace.
+
+    Garantit qu'un snippet rendu en HTML par un CMS (guillemets typo, nbsp,
+    apostrophes courbes) matche bien la version source meme si la copie a
+    transite par un editeur WYSIWYG qui re-encode les caracteres."""
+    if not text:
+        return ""
+    s = text.translate(_FANCY_PUNCT_MAP)
+    s = s.lower()
+    s = _WHITESPACE_RE.sub(" ", s).strip()
+    return s
+
+
+def _html_to_text(html: str) -> str:
+    """Extrait le texte d'une page HTML. Strip scripts/styles/noscript/header/
+    footer/nav. Conserve le texte des balises restantes."""
+    if not html:
+        return ""
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+    # Ne pas supprimer header/footer/nav par defaut : la description produit
+    # peut etre dans une div sans semantique claire, et ce niveau de strip
+    # n'est pas necessaire au check de match. On extrait tout le body.
+    return soup.get_text(separator=" ", strip=True)
+
+
+# Mots vides ignores au calcul du fallback fuzzy. Garde seulement les mots
+# significatifs >= 4 chars. Le fallback fuzzy n'est utilise que si le match
+# exact normalise echoue (devrait etre rare).
+_FUZZY_MIN_CONSECUTIVE_WORDS = 12
+
+
+def _validate_match_in_html(
+    candidate_url: str,
+    snippet_normalized: str,
+    html_cache: dict[str, str | None],
+    timeout: int = 8,
+) -> dict:
+    """Niveau 2 : verifier que la phrase recherchee apparait litteralement
+    dans le HTML de l'URL candidate.
+
+    Retourne {"valid": bool, "reason": str, "url": str}.
+
+    Logique :
+    - Cache par URL (la meme URL peut etre candidate sur 2 snippets distincts
+      via les SERP DataForSEO, surtout sur des catalogue similaires).
+    - safe_get protege contre les SSRF (IPs privees, etc.).
+    - Si HTTP error (404, 403, 5xx) ou timeout : invalid, raison loggee.
+    - Match exact sur le texte normalise : si la phrase normalisee est dans
+      le texte normalise du HTML, c'est valide.
+    - Fallback fuzzy : si match exact echoue, decouper le snippet en mots
+      significatifs (>= 4 chars), chercher une fenetre glissante de >= 12 mots
+      consecutifs identiques dans le texte. Couvre les cas ou le site cible
+      a tronque la phrase ou ajoute un mot au milieu.
+    - Sinon : invalid, raison "phrase absente du HTML".
+    """
+    if candidate_url in html_cache:
+        cached_html = html_cache[candidate_url]
+        if cached_html is None:
+            return {"valid": False, "reason": "fetch_error (cached)", "url": candidate_url}
+    else:
+        try:
+            resp = safe_get(
+                candidate_url,
+                headers=default_headers(),
+                timeout=timeout,
+                allow_redirects=True,
+                max_response_bytes=2 * 1024 * 1024,
+            )
+            if resp.status_code >= 400:
+                html_cache[candidate_url] = None
+                return {
+                    "valid": False,
+                    "reason": f"HTTP {resp.status_code}",
+                    "url": candidate_url,
+                }
+            cached_html = resp.text
+            html_cache[candidate_url] = cached_html
+        except Exception as exc:
+            html_cache[candidate_url] = None
+            return {
+                "valid": False,
+                "reason": f"fetch_error: {type(exc).__name__}",
+                "url": candidate_url,
+            }
+
+    page_text_normalized = _normalize_for_match(_html_to_text(cached_html))
+    if not page_text_normalized:
+        return {"valid": False, "reason": "empty_text", "url": candidate_url}
+
+    # Match exact sur le texte normalise.
+    if snippet_normalized in page_text_normalized:
+        return {"valid": True, "reason": "exact_match", "url": candidate_url}
+
+    # Fallback fuzzy : >= 12 mots consecutifs significatifs identiques.
+    snippet_words = [w for w in snippet_normalized.split() if len(w) >= 4]
+    if len(snippet_words) < _FUZZY_MIN_CONSECUTIVE_WORDS:
+        return {"valid": False, "reason": "phrase_absent_short_snippet", "url": candidate_url}
+
+    page_words = page_text_normalized.split()
+    page_set_index: dict[str, list[int]] = {}
+    for i, w in enumerate(page_words):
+        page_set_index.setdefault(w, []).append(i)
+
+    # Fenetre glissante : pour chaque position de depart du snippet, chercher
+    # si une fenetre de N mots consecutifs apparait dans la page.
+    n = _FUZZY_MIN_CONSECUTIVE_WORDS
+    for start_pos in range(0, len(snippet_words) - n + 1):
+        window = snippet_words[start_pos:start_pos + n]
+        first_word = window[0]
+        candidates_pos = page_set_index.get(first_word, [])
+        for p in candidates_pos:
+            if p + n > len(page_words):
+                continue
+            if page_words[p:p + n] == window:
+                return {"valid": True, "reason": f"fuzzy_match_{n}_words", "url": candidate_url}
+    return {"valid": False, "reason": "phrase_absent_fuzzy", "url": candidate_url}
+
+
 def _parse_serp_response(payload: dict, audited_domain: str) -> dict:
-    """Extract domain counts from a DataForSEO live advanced response."""
-    result = {"total_results": 0, "domains": [], "raw_status": None}
+    """Extract candidate items from a DataForSEO live advanced response.
+
+    Refonte 29/05 : retourne maintenant la liste des items (domain + url)
+    plutot que des domain_counts. La validation N2 (HTML brut) est faite
+    en aval dans la boucle run(), parce qu'il faut acceder a l'URL exacte
+    pour fetcher le HTML, pas juste le domaine."""
+    result: dict = {"items": [], "raw_status": None}
     tasks = payload.get("tasks") or []
     if not tasks:
         result["raw_status"] = payload.get("status_message")
         return result
     task = tasks[0]
     result["raw_status"] = task.get("status_message")
+    seen_urls: set[str] = set()
     for outer in task.get("result") or []:
         items = outer.get("items") or []
-        domain_counts: dict[str, int] = {}
         for item in items:
             if item.get("type") != "organic":
                 continue
             domain = (item.get("domain") or "").lower().lstrip("www.")
-            if not domain or domain == audited_domain:
+            url = item.get("url") or ""
+            if not domain or domain == audited_domain or not url:
                 continue
             if _is_excluded_domain(domain):
                 continue
-            domain_counts[domain] = domain_counts.get(domain, 0) + 1
-        result["domains"] = sorted(domain_counts.keys())
-        result["total_results"] = sum(domain_counts.values())
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            result["items"].append({"domain": domain, "url": url})
     return result
 
 
@@ -450,6 +604,10 @@ def run(urls_file: str, max_urls: int, snippet_len: int, threshold: int,
 
     checked: list[dict] = []
     suspect_count = 0
+    # Cache HTML partage entre toutes les URLs auditees. Si plusieurs fiches
+    # BSD ont les memes concurrents dans leur SERP, on ne fetch chaque URL
+    # tierce qu'une seule fois.
+    html_cache: dict[str, str | None] = {}
     for entry in products:
         url = entry["url"]
         page = _fetch_snippet(url, snippet_len, timeout=timeout, cms_hint=cms_hint)
@@ -467,27 +625,61 @@ def run(urls_file: str, max_urls: int, snippet_len: int, threshold: int,
             "manufacturer_copy_suspect": False,
             "serp_status": None,
             "per_snippet_results": [],
+            # Compteurs N2 (validation HTML). Niveau 1 (SERP) = candidates.
+            # Niveau 2 (fetch HTML + check phrase) = validated.
+            "n2_total_candidates": 0,
+            "n2_validated": 0,
+            "n2_rejected": [],
         }
         if snippets_tried:
             # Per-domain count across snippets: a domain that appears in 2+
             # snippets is a much stronger signal of duplicated description
             # than a domain matched on a single snippet.
+            #
+            # Refonte 29/05 : chaque candidat SERP est valide via fetch HTML
+            # avant d'etre compte dans domain_hits. Les candidats invalides
+            # (phrase absente du HTML, HTTP error, timeout) sont jetes et
+            # logges dans n2_rejected.
             domain_hits: dict[str, int] = {}
             matched_snippets = 0
             statuses = []
             for snip in snippets_tried:
+                snip_normalized = _normalize_for_match(snip)
                 try:
                     response = _dataforseo_serp(snip, login, password)
                     parsed = _parse_serp_response(response, audited_domain)
-                    if parsed["domains"]:
-                        matched_snippets += 1
-                    for d in parsed["domains"]:
-                        domain_hits[d] = domain_hits.get(d, 0) + 1
                     statuses.append(parsed["raw_status"] or "ok")
+                    n1_candidates = parsed["items"]
+                    record["n2_total_candidates"] += len(n1_candidates)
+                    # Validation N2 : fetch HTML de chaque candidat, verifier
+                    # presence litterale de la phrase. Seuls les valides
+                    # comptent dans domain_hits.
+                    validated_domains: set[str] = set()
+                    for cand in n1_candidates:
+                        check = _validate_match_in_html(
+                            cand["url"], snip_normalized, html_cache,
+                            timeout=timeout,
+                        )
+                        if check["valid"]:
+                            validated_domains.add(cand["domain"])
+                            record["n2_validated"] += 1
+                        else:
+                            record["n2_rejected"].append({
+                                "domain": cand["domain"],
+                                "url": cand["url"],
+                                "snippet_excerpt": snip[:60],
+                                "reason": check["reason"],
+                            })
+                    if validated_domains:
+                        matched_snippets += 1
+                    for d in validated_domains:
+                        domain_hits[d] = domain_hits.get(d, 0) + 1
                     record["per_snippet_results"].append({
                         "snippet": snip[:80],
-                        "domains_count": len(parsed["domains"]),
-                        "sample_domains": parsed["domains"][:5],
+                        "n1_candidates": len(n1_candidates),
+                        "n2_validated_domains": sorted(validated_domains)[:5],
+                        "domains_count": len(validated_domains),
+                        "sample_domains": sorted(validated_domains)[:5],
                     })
                 except Exception as exc:
                     statuses.append(f"request failed: {exc}")
@@ -525,6 +717,24 @@ def run(urls_file: str, max_urls: int, snippet_len: int, threshold: int,
             record["total_snippets"] = total_snippets
             record["intensity"] = intensity
             record["serp_status"] = "; ".join(statuses)
+            # Garde-fou N2 : si > 50% des candidats SERP echouent au check
+            # HTML brut, Google a probablement tolere les guillemets sur le
+            # snippet (longue chaine, mots-cles communs). Signal de
+            # tolerance: le compteur N1 etait gonfle par des faux positifs.
+            # On expose la statistique sans changer le finding (le finding
+            # est deja base sur N2 valide), mais on la log dans le rapport.
+            n2_total = record["n2_total_candidates"]
+            n2_valid = record["n2_validated"]
+            if n2_total > 0:
+                n2_rejection_ratio = (n2_total - n2_valid) / n2_total
+                record["n2_rejection_ratio"] = round(n2_rejection_ratio, 2)
+                if n2_rejection_ratio > 0.5:
+                    record["n2_warning"] = (
+                        f"Forte tolerance Google : {n2_total - n2_valid}/{n2_total} "
+                        f"candidats SERP rejetes au check HTML brut. Le compteur "
+                        f"N1 etait gonfle par des faux positifs (phrase tronquee "
+                        f"ou tolerance guillemets sur snippet long)."
+                    )
 
             # SUSPECT requires recurrent domains. A domain matched on a single
             # snippet is almost always noise — a generic phrase or product name
