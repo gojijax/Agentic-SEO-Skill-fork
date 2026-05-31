@@ -129,7 +129,20 @@ def main():
                 audit_date=audit_date,
                 client_name=args.client_name,
             )
-            json_out_path = os.path.abspath(args.actions_json)
+            # Fix 31/05 apres lecomptoirdelaplage : si --actions-json est
+            # passe relatif ou laisse par defaut (= "02-BHUNA-actions.json"),
+            # il etait resolu en CWD (racine repo BHUNA) et le consolidateur
+            # ne trouvait pas le fichier dans le dossier audit. Maintenant on
+            # derive le dossier de sortie depuis --json (= 02-BHUNA-data.json)
+            # qui est lui correctement passe en chemin absolu vers le dossier
+            # audit. L'utilisateur peut toujours overrider via --actions-json.
+            actions_json_arg = args.actions_json
+            if not os.path.isabs(actions_json_arg) and os.path.basename(actions_json_arg) == actions_json_arg:
+                # --actions-json est juste un nom de fichier (defaut), pas un
+                # chemin. On l'ecrit dans le meme dossier que --json.
+                derived_dir = os.path.dirname(os.path.abspath(args.json_output))
+                actions_json_arg = os.path.join(derived_dir, actions_json_arg)
+            json_out_path = os.path.abspath(actions_json_arg)
             output_dir = os.path.dirname(json_out_path) or "."
             # write_actions_files writes both .json and .md side by side. We
             # honour --actions-json by renaming the JSON output if needed.
