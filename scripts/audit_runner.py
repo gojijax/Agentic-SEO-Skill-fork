@@ -68,8 +68,10 @@ def main():
     parser.add_argument("--html", default="", help="HTML report output path (default: 02-BHUNA-dashboard.html)")
     parser.add_argument("--markdown", default="02-BHUNA-rapport.md",
                         help="Markdown audit output path (default: 02-BHUNA-rapport.md)")
-    parser.add_argument("--action-plan", default="02-BHUNA-actions.md",
-                        help="Markdown action-plan output path (default: 02-BHUNA-actions.md)")
+    parser.add_argument("--action-plan", default="02-BHUNA-action-plan.md",
+                        help="Markdown action-plan output path (default: 02-BHUNA-action-plan.md). "
+                             "Renomme 31/05 pour eviter la collision avec le .md canonique "
+                             "ecrit par write_actions_files (qui sort 02-BHUNA-actions.md).")
     parser.add_argument("--actions-json", default="02-BHUNA-actions.json",
                         help="Canonical actions JSON output path "
                              "(default: 02-BHUNA-actions.json). Conforms to "
@@ -93,6 +95,17 @@ def main():
                         help="Optional path to a urls.json file (audit-prospect-cowork contract). "
                              "Enables hybrid mode: per-page checks iterate over the listed URLs.")
     args = parser.parse_args()
+
+    # Fix 31/05 apres lecomptoirdelaplage : si --markdown, --action-plan, --html
+    # sont laissees a leur default (= un simple nom de fichier), on les derive
+    # dans le meme dossier que --json (= 02-BHUNA-data.json). Sinon ils
+    # tombaient dans CWD. Le user peut toujours overrider avec un chemin
+    # absolu explicite.
+    _json_dir = os.path.dirname(os.path.abspath(args.json_output))
+    for arg_name in ("markdown", "action_plan", "actions_json", "html"):
+        v = getattr(args, arg_name, "") or ""
+        if v and not os.path.isabs(v) and os.path.basename(v) == v:
+            setattr(args, arg_name, os.path.join(_json_dir, v))
 
     scoring_config = load_scoring_config()
     data = collect_data(args.url, urls_file=args.urls_file)
