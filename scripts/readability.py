@@ -304,28 +304,34 @@ def analyze_readability(text: str) -> dict:
 
     # If the page appears to be homepage/navigation-heavy and we cannot extract
     # clean prose sentences, provide actionable homepage replacement targets.
+    # Exemples genericises e-commerce 01/06 apres revue MVP : les anciens
+    # exemples etaient codes en dur sur la cybersecurite (ethical hacking,
+    # Active Directory, Wi-Fi security) ce qui fuitait dans des livrables
+    # prospect e-commerce et donnait un signal "outil bricole sur un autre
+    # metier".
     if not result["sentence_rewrites"] and (result["avg_sentence_length"] > 25 or fre_val < 40):
         result["sentence_rewrites"].extend([
             {
-                "current": "Homepage hero intro block is broad and hard to scan.",
+                "current": "Le bloc d'introduction de la page d'accueil est trop large et difficile a scanner.",
                 "suggested": (
-                    "Use a 2-3 sentence hero: who you help, what users can do here, and "
-                    "where to start. Example: \"Learn practical ethical hacking with "
-                    "step-by-step guides. Start with Wi-Fi security, Active Directory, or "
-                    "malware analysis using the tracks below.\""
+                    "Utiliser une intro de 2-3 phrases : a qui vous vous adressez, "
+                    "ce qu'on peut faire ici, par ou commencer. "
+                    "Exemple : \"Decouvrez nos collections de [produit phare] "
+                    "fabriquees en France. Parcourez nos categories principales "
+                    "ou commencez par nos meilleures ventes.\""
                 ),
                 "current_word_count": "template",
-                "target_word_count": "40-60 total (split into 2-3 sentences)",
+                "target_word_count": "40-60 mots au total (en 2-3 phrases)",
             },
             {
-                "current": "Section descriptions mix too many topics in one long paragraph.",
+                "current": "Les descriptions de section melangent trop de sujets en un seul paragraphe.",
                 "suggested": (
-                    "Replace with short blurbs per section (1 sentence each) and add a clear "
-                    "CTA link: \"Start Wi-Fi Security\", \"Explore AD Attack Paths\", "
-                    "\"View Red-Team Cheat Sheets\"."
+                    "Remplacer par des descriptions courtes par section (1 phrase chacune) "
+                    "avec un CTA clair. Exemple : \"Voir nos [categorie A]\", "
+                    "\"Decouvrir [categorie B]\", \"Lire le guide [theme]\"."
                 ),
                 "current_word_count": "template",
-                "target_word_count": "12-20 words per blurb",
+                "target_word_count": "12-20 mots par description",
             },
         ])
 

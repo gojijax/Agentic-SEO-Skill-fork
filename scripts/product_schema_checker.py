@@ -12,15 +12,26 @@ from seo_common import issue, print_json_or_text
 
 
 VALID_AVAILABILITY = {
+    # Forme HTTPS canonique
     "https://schema.org/InStock",
     "https://schema.org/OutOfStock",
     "https://schema.org/PreOrder",
     "https://schema.org/BackOrder",
     "https://schema.org/LimitedAvailability",
+    # Forme HTTP (ajout 01/06 apres revue MVP) : beaucoup d'anciens PrestaShop
+    # et WooCommerce declarent encore l'availability en http://schema.org/...
+    # Faux warning si on ne les accepte pas comme valides.
+    "http://schema.org/InStock",
+    "http://schema.org/OutOfStock",
+    "http://schema.org/PreOrder",
+    "http://schema.org/BackOrder",
+    "http://schema.org/LimitedAvailability",
+    # Forme courte (nom seul)
     "InStock",
     "OutOfStock",
     "PreOrder",
     "BackOrder",
+    "LimitedAvailability",  # manquait avant 01/06
 }
 
 

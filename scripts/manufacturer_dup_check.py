@@ -136,7 +136,7 @@ def _is_excluded_domain(domain: str) -> bool:
     """True if a domain should be ignored in the duplicate analysis (CDN, social, etc.)."""
     if not domain:
         return True
-    d = domain.lower().lstrip("www.")
+    d = domain.lower().removeprefix("www.")
     if d in EXCLUDED_DOMAINS:
         return True
     # Match suffixes too (e.g. random.scene7.com)
@@ -536,7 +536,7 @@ def _parse_serp_response(payload: dict, audited_domain: str) -> dict:
         for item in items:
             if item.get("type") != "organic":
                 continue
-            domain = (item.get("domain") or "").lower().lstrip("www.")
+            domain = (item.get("domain") or "").lower().removeprefix("www.")
             url = item.get("url") or ""
             if not domain or domain == audited_domain or not url:
                 continue
@@ -567,7 +567,7 @@ def run(urls_file: str, max_urls: int, snippet_len: int, threshold: int,
     except (OSError, json.JSONDecodeError) as exc:
         return {"error": f"could not read urls file: {exc}", "checked": []}
 
-    audited_domain = (urls_meta.get("domain") or "").lower().lstrip("www.")
+    audited_domain = (urls_meta.get("domain") or "").lower().removeprefix("www.")
 
     # Look up the CMS detected at scraping time. Try urls.json's own
     # cms_detected field first, then the sibling scraping.json / output.json
@@ -591,7 +591,7 @@ def run(urls_file: str, max_urls: int, snippet_len: int, threshold: int,
         # Fallback: derive from the first URL.
         for entry in urls_meta.get("urls", []):
             if entry.get("url"):
-                audited_domain = urlparse(entry["url"]).netloc.lower().lstrip("www.")
+                audited_domain = urlparse(entry["url"]).netloc.lower().removeprefix("www.")
                 break
 
     products = [
