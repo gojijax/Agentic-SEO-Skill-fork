@@ -55,6 +55,15 @@ BUSINESS_FOCUSED_SCRIPT_WHITELIST = {
     "duplicate_content", # duplicate_content.py
     "readability",       # readability.py
     "freshness",         # freshness_checker.py
+    # Technique - Performance (ajoute 01/06 apres revue MVP).
+    # Le script tourne pour obtenir le score 0-100. Les findings
+    # detailles (LCP, INP, CLS, render-blocking, etc.) sont droppes
+    # cote seo-skills-custom bhuna_actions_builder. SEULE une action
+    # generique "Performance degradee a investiguer" est emise si le
+    # score est < 50. Au-dessus, rien (le prospect n'a pas besoin
+    # d'une analyse Core Web Vitals detaillee, c'est un sujet hors
+    # angle business-focused).
+    "pagespeed",         # pagespeed_checker.py
     # Maillage interne :
     # internal_links et link_profile RETIRES 01/06 apres revue MVP.
     # Raisons :
