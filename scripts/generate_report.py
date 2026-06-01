@@ -746,147 +746,193 @@ def collect_data(url: str, urls_file: str | None = None) -> dict:
 
 
 def calculate_overall_score(data: dict, scoring_config: dict | None = None) -> dict:
-    """Calculate overall SEO score from all analyses."""
+    """Calculate overall SEO score from all analyses.
+
+    Refonte 01/06 apres revue MVP : ne compte dans la moyenne pondéree
+    QUE les categories effectivement executees (section presente et non
+    vide dans data["sections"]). Avant ce fix, les sections absentes
+    (cas BHUNA_MODE=business ou les 9 categories non-whitelistees ne
+    tournaient pas) etaient notees 0 par defaut et tiraient le score
+    global vers le bas. Resultat : un site PARFAIT sur les 5 categories
+    whitelistees plafonnait a 53/100 (calcul reproduit empiriquement).
+
+    Nouveau comportement : si une categorie est skip par la whitelist,
+    son score n'est pas calcule ni ajoute au dict scores, et le diviseur
+    de la moyenne pondere n'inclut pas son poids. Le score global devient
+    representatif de ce qui a vraiment ete mesure.
+    """
     scores = {}
     scoring_config = scoring_config or load_scoring_config()
     weights = get_scoring_weights(scoring_config)
 
+    sections = data.get("sections", {})
+
+    def _executed(name: str) -> bool:
+        """True si la section est presente dans data avec du contenu.
+        Une section absente (key manquante) ou explicitement vide ({} ou
+        skipped=True) signifie que le check n'a pas tourne. Une section
+        avec uniquement un field 'error' compte comme executee : c'est
+        un signal de probleme reel, son score doit etre comptabilise."""
+        sec = sections.get(name)
+        if not isinstance(sec, dict):
+            return False
+        if sec.get("skipped"):
+            return False
+        if len(sec) == 0:
+            return False
+        return True
+
     # Security score
-    sec = data["sections"].get("security", {})
-    scores["security"] = sec.get("score", 0)
+    if _executed("security"):
+        sec = sections["security"]
+        scores["security"] = sec.get("score", 0)
 
     # Social meta score
-    soc = data["sections"].get("social", {})
-    scores["social"] = soc.get("score", 0)
+    if _executed("social"):
+        soc = sections["social"]
+        scores["social"] = soc.get("score", 0)
 
     # Robots score
-    rob = data["sections"].get("robots", {})
-    if rob.get("status") == 200:
-        base = 60
-        if rob.get("sitemaps"):
-            base += 20
-        ai_managed = sum(1 for s in rob.get("ai_crawler_status", {}).values()
-                         if "not managed" not in s)
-        base += min(20, ai_managed * 2)
-        scores["robots"] = min(100, base)
-    elif rob.get("status") == 404:
-        scores["robots"] = 20
-    else:
-        scores["robots"] = 0
+    if _executed("robots"):
+        rob = sections["robots"]
+        if rob.get("status") == 200:
+            base = 60
+            if rob.get("sitemaps"):
+                base += 20
+            ai_managed = sum(1 for s in rob.get("ai_crawler_status", {}).values()
+                             if "not managed" not in s)
+            base += min(20, ai_managed * 2)
+            scores["robots"] = min(100, base)
+        elif rob.get("status") == 404:
+            scores["robots"] = 20
+        else:
+            scores["robots"] = 0
 
     # Article score (informational, not weighted heavily)
-    art = data["sections"].get("article", {})
-    if art and not art.get("error"):
-        art_score = 50
-        if art.get("target_keyword"): art_score += 25
-        if art.get("lsi_keywords"): art_score += 25
-        scores["article"] = min(100, art_score)
-    else:
-        scores["article"] = 0
+    if _executed("article"):
+        art = sections["article"]
+        if not art.get("error"):
+            art_score = 50
+            if art.get("target_keyword"): art_score += 25
+            if art.get("lsi_keywords"): art_score += 25
+            scores["article"] = min(100, art_score)
+        else:
+            scores["article"] = 0
 
     # Broken links score
-    bl = data["sections"].get("broken_links", {})
-    summary = bl.get("summary", {})
-    total = summary.get("total", 1) or 1
-    broken = summary.get("broken", 0)
-    scores["broken_links"] = max(0, 100 - int((broken / total) * 300))
+    if _executed("broken_links"):
+        bl = sections["broken_links"]
+        summary = bl.get("summary", {})
+        total = summary.get("total", 1) or 1
+        broken = summary.get("broken", 0)
+        scores["broken_links"] = max(0, 100 - int((broken / total) * 300))
 
     # Internal links score
-    il = data["sections"].get("internal_links", {})
-    il_issues = len(il.get("issues", []))
-    scores["internal_links"] = max(0, 100 - il_issues * 20)
+    if _executed("internal_links"):
+        il = sections["internal_links"]
+        il_issues = len(il.get("issues", []))
+        scores["internal_links"] = max(0, 100 - il_issues * 20)
 
     # Redirects score
-    red = data["sections"].get("redirects", {})
-    red_issues = len(red.get("issues", []))
-    scores["redirects"] = max(0, 100 - red_issues * 25)
+    if _executed("redirects"):
+        red = sections["redirects"]
+        red_issues = len(red.get("issues", []))
+        scores["redirects"] = max(0, 100 - red_issues * 25)
 
     # llms.txt score
-    llm = data["sections"].get("llms_txt", {})
-    if llm.get("exists"):
-        scores["llms_txt"] = llm.get("quality", {}).get("score", 0)
-    else:
-        scores["llms_txt"] = 0
+    if _executed("llms_txt"):
+        llm = sections["llms_txt"]
+        if llm.get("exists"):
+            scores["llms_txt"] = llm.get("quality", {}).get("score", 0)
+        else:
+            scores["llms_txt"] = 0
 
     # PageSpeed score
-    psi = data["sections"].get("pagespeed", {})
-    scores["pagespeed"] = psi.get("performance_score", 0)
+    if _executed("pagespeed"):
+        psi = sections["pagespeed"]
+        scores["pagespeed"] = psi.get("performance_score", 0)
 
     # On-page score
-    op = data["sections"].get("onpage", {})
-    if op and not op.get("error"):
-        op_score = 50
-        if op.get("title"): op_score += 15
-        if op.get("meta_description"): op_score += 15
-        if op.get("h1"): op_score += 10
-        if op.get("canonical"): op_score += 10
-        scores["onpage"] = min(100, op_score)
-    else:
-        scores["onpage"] = 0
+    if _executed("onpage"):
+        op = sections["onpage"]
+        if not op.get("error"):
+            op_score = 50
+            if op.get("title"): op_score += 15
+            if op.get("meta_description"): op_score += 15
+            if op.get("h1"): op_score += 10
+            if op.get("canonical"): op_score += 10
+            scores["onpage"] = min(100, op_score)
+        else:
+            scores["onpage"] = 0
 
     # Readability score
-    rd = data["sections"].get("readability", {})
-    flesch = rd.get("flesch_reading_ease", 0)
-    if flesch >= 60:
-        scores["readability"] = 100
-    elif flesch >= 30:
-        scores["readability"] = 50 + int((flesch - 30) * (50 / 30))
-    else:
-        scores["readability"] = max(0, int(flesch * (50 / 30)))
+    if _executed("readability"):
+        rd = sections["readability"]
+        flesch = rd.get("flesch_reading_ease", 0)
+        if flesch >= 60:
+            scores["readability"] = 100
+        elif flesch >= 30:
+            scores["readability"] = 50 + int((flesch - 30) * (50 / 30))
+        else:
+            scores["readability"] = max(0, int(flesch * (50 / 30)))
 
     # Entity SEO score
-    ent = data["sections"].get("entity", {})
-    if ent and not ent.get("error"):
-        sameas = ent.get("sameas_analysis", {})
-        found = sameas.get("total_found", 0)
-        missing = sameas.get("total_missing_critical", 4)
-        has_wikidata = 1 if ent.get("wikidata", {}).get("found") else 0
-        has_wikipedia = 1 if ent.get("wikipedia", {}).get("found") else 0
-        ent_score = min(100, found * 15 + has_wikidata * 25 + has_wikipedia * 25)
-        issues_count = len(ent.get("issues", []))
-        ent_score = max(0, ent_score - issues_count * 10)
-        scores["entity"] = ent_score
-    else:
-        scores["entity"] = 0
+    if _executed("entity"):
+        ent = sections["entity"]
+        if not ent.get("error"):
+            sameas = ent.get("sameas_analysis", {})
+            found = sameas.get("total_found", 0)
+            missing = sameas.get("total_missing_critical", 4)
+            has_wikidata = 1 if ent.get("wikidata", {}).get("found") else 0
+            has_wikipedia = 1 if ent.get("wikipedia", {}).get("found") else 0
+            ent_score = min(100, found * 15 + has_wikidata * 25 + has_wikipedia * 25)
+            issues_count = len(ent.get("issues", []))
+            ent_score = max(0, ent_score - issues_count * 10)
+            scores["entity"] = ent_score
+        else:
+            scores["entity"] = 0
 
     # Link profile score
-    lp = data["sections"].get("link_profile", {})
-    if lp and not lp.get("error"):
-        avg_links = lp.get("avg_internal_links_per_page", 0)
-        orphans = lp.get("orphan_pages", {}).get("count", 0)
-        dead_ends = lp.get("dead_end_pages", {}).get("count", 0)
-        lp_score = 70
-        if avg_links >= 5: lp_score += 15
-        elif avg_links >= 3: lp_score += 5
-        else: lp_score -= 15
-        lp_score -= min(30, orphans * 5)
-        lp_score -= min(20, dead_ends * 3)
-        scores["link_profile"] = max(0, min(100, lp_score))
-    else:
-        scores["link_profile"] = 0
+    if _executed("link_profile"):
+        lp = sections["link_profile"]
+        if not lp.get("error"):
+            avg_links = lp.get("avg_internal_links_per_page", 0)
+            orphans = lp.get("orphan_pages", {}).get("count", 0)
+            dead_ends = lp.get("dead_end_pages", {}).get("count", 0)
+            lp_score = 70
+            if avg_links >= 5: lp_score += 15
+            elif avg_links >= 3: lp_score += 5
+            else: lp_score -= 15
+            lp_score -= min(30, orphans * 5)
+            lp_score -= min(20, dead_ends * 3)
+            scores["link_profile"] = max(0, min(100, lp_score))
+        else:
+            scores["link_profile"] = 0
 
     # Hreflang score (skip weight if not applicable)
-    hf = data["sections"].get("hreflang", {})
-    if hf and not hf.get("error"):
-        if hf.get("hreflang_tags_found", 0) > 0:
-            summary = hf.get("summary", {})
-            hf_score = 100 - summary.get("critical", 0) * 30 - summary.get("high", 0) * 15 - summary.get("medium", 0) * 5
-            scores["hreflang"] = max(0, min(100, hf_score))
+    if _executed("hreflang"):
+        hf = sections["hreflang"]
+        if not hf.get("error"):
+            if hf.get("hreflang_tags_found", 0) > 0:
+                summary = hf.get("summary", {})
+                hf_score = 100 - summary.get("critical", 0) * 30 - summary.get("high", 0) * 15 - summary.get("medium", 0) * 5
+                scores["hreflang"] = max(0, min(100, hf_score))
+            else:
+                # No hreflang = single language site, skip from weighting
+                scores["hreflang"] = None
         else:
-            # No hreflang = single language site, skip from weighting
             scores["hreflang"] = None
-    else:
-        scores["hreflang"] = None
 
     # Duplicate content score
-    dc = data["sections"].get("duplicate_content", {})
-    if dc and not dc.get("error"):
-        dupes = len(dc.get("near_duplicates", []))
-        thin = len(dc.get("thin_pages", []))
-        dc_score = 100 - dupes * 20 - thin * 10
-        scores["duplicate_content"] = max(0, min(100, dc_score))
-    else:
-        scores["duplicate_content"] = 0
+    if _executed("duplicate_content"):
+        dc = sections["duplicate_content"]
+        if not dc.get("error"):
+            dupes = len(dc.get("near_duplicates", []))
+            thin = len(dc.get("thin_pages", []))
+            dc_score = 100 - dupes * 20 - thin * 10
+            scores["duplicate_content"] = max(0, min(100, dc_score))
+        else:
+            scores["duplicate_content"] = 0
 
     # Weighted average (only scored categories)
     total_weight = 0
