@@ -62,9 +62,19 @@ def check_canonicals(urls: list[str], timeout: int = 15, check_targets: bool = F
                     issues.append(issue("error", "Canonical target is not 200", row["url"], str(target.get("status"))))
                 if target.get("text"):
                     target_html = parse_html(target["text"], target.get("url") or canonical)
-                    if target_html.get("canonical") and normalize_url(target_html["canonical"]) != canonical:
-                        row["issues"].append("canonical chain detected")
-                        issues.append(issue("warning", "Canonical target points elsewhere", row["url"], target_html["canonical"]))
+                    # Fix 01/06 : normalize_url du canonical cible doit
+                    # recevoir la base URL pour resoudre les canonical relatifs.
+                    # Sinon "<link rel=canonical href=/produit/x>" sur la page
+                    # cible donnait "/produit/x" et != canonical absolu,
+                    # declenchant un faux "chain detected".
+                    if target_html.get("canonical"):
+                        target_canonical = normalize_url(
+                            target_html["canonical"],
+                            target.get("url") or canonical,
+                        )
+                        if target_canonical != canonical:
+                            row["issues"].append("canonical chain detected")
+                            issues.append(issue("warning", "Canonical target points elsewhere", row["url"], target_canonical))
         rows.append(row)
     duplicates = {canonical: pages for canonical, pages in canonical_to_pages.items() if len(pages) > 1}
     return {"count": len(rows), "rows": rows, "duplicate_canonical_targets": duplicates, "issues": issues}
