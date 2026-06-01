@@ -55,9 +55,20 @@ BUSINESS_FOCUSED_SCRIPT_WHITELIST = {
     "duplicate_content", # duplicate_content.py
     "readability",       # readability.py
     "freshness",         # freshness_checker.py
-    # Maillage interne
-    "internal_links",    # internal_links.py
-    "link_profile",      # link_profile.py
+    # Maillage interne :
+    # internal_links et link_profile RETIRES 01/06 apres revue MVP.
+    # Raisons :
+    # - internal_links.py : netloc strict www vs apex (bug confirme sur
+    #   french-bandit : pages_crawled=1, total_internal=0). Limitations
+    #   structurelles : 15 pages max, inclut le chrome (menu/footer)
+    #   dans les counts -> diagnostic biaisé. Le crawl ECOM via Gephi
+    #   content-only fait ce travail nettement mieux.
+    # - link_profile.py : GSC backlinks non opérationnel, le script compte
+    #   en pratique du maillage interne avec un bug min() lexicographique
+    #   sur la detection d'orphelines. Output peu fiable.
+    # Le maillage interne est desormais traite ENTIEREMENT cote
+    # seo-skills-custom (crawl_actions_builder + graph_export Gephi
+    # content-only). Aucune perte de couverture cote roadmap.
     # manufacturer_dup_check est lance en dehors de la liste analyses
     # (bloc dedie en mode hybride) et reste actif en business-focused.
 }

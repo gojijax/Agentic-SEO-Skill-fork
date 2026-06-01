@@ -20,7 +20,25 @@ def check_canonicals(urls: list[str], timeout: int = 15, check_targets: bool = F
         if fetched.get("text"):
             html = parse_html(fetched["text"], fetched.get("url") or url)
             row["canonical"] = html.get("canonical")
-        if not row["canonical"]:
+        # Fix 01/06 apres revue MVP : distinguer "fetch failed" (403 WAF,
+        # timeout, 5xx) du vrai "canonical absent". Sur aquaflam (WAF
+        # Security Pro) toutes les URLs (18/18) ressortaient "Missing
+        # canonical" alors que c'etaient des 403 ou la page n'avait
+        # meme pas pu etre lue. Pattern identique au traitement
+        # security_blocked deja en place dans broken_links.py.
+        status = fetched.get("status")
+        fetch_failed = (
+            status is None
+            or status == 0
+            or (isinstance(status, int) and (status == 403 or status >= 500 or status == 408))
+        )
+        if fetch_failed and not row["canonical"]:
+            row["verdict"] = "security_blocked"
+            row["issues"].append(f"fetch failed (HTTP {status})")
+            # Pas d'issue propagee : on ne peut pas conclure sur le
+            # canonical d'une page qu'on n'a pas pu lire. Laisse le
+            # consultant decider via re-fetch avec UA navigateur.
+        elif not row["canonical"]:
             row["verdict"] = "missing"
             row["issues"].append("missing canonical")
             issues.append(issue("warning", "Missing canonical", row["url"]))
