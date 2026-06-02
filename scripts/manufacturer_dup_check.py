@@ -846,7 +846,19 @@ def main() -> None:
             f.write("\n")
         print(f"Wrote {args.output}")
     else:
-        print(payload)
+        # Fix 01/06 apres Meyson : print(payload) plante sur console Windows
+        # cp1252 quand le payload contient des caracteres unicode hors
+        # latin-1 (caracteres special, emoji, etc. dans les titres
+        # produits scrapes). On force l'output en UTF-8 + fallback "?"
+        # sur les caracteres non-encodable, et on flush sur stdout.buffer
+        # pour bypass le wrapping cp1252 par defaut.
+        import sys as _sys
+        try:
+            _sys.stdout.buffer.write(payload.encode("utf-8") + b"\n")
+            _sys.stdout.flush()
+        except (AttributeError, OSError):
+            # Fallback : encode + decode avec replace pour eviter le crash
+            print(payload.encode("utf-8", errors="replace").decode("utf-8", errors="replace"))
 
 
 if __name__ == "__main__":

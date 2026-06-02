@@ -158,25 +158,54 @@ def get_scoring_weights(config: dict | None = None) -> dict:
     }
 
 
-def run_script(script_name: str, args: list, timeout: int = 120) -> dict:
-    """Run an analysis script and capture JSON output."""
+def run_script(script_name: str, args: list, timeout: int = 120, max_retries: int = 1) -> dict:
+    """Run an analysis script and capture JSON output.
+
+    Refonte 01/06 apres bug Meyson (manufacturer_dup_check
+    UnicodeEncodeError + duplicate_content timeout) : ajout d'un retry
+    automatique apres 5 sec en cas d'erreur recuperable. Erreurs
+    recuperables :
+    - Script timed out : peut etre un pic de charge transitoire
+    - Exit code non-zero avec stderr non-vide : peut etre un bug
+      reproductible (mais on tente quand meme un retry)
+    - Invalid JSON : peut etre une sortie partielle interrompue
+
+    Pas de retry sur "Script not found" (deterministe).
+    """
+    import time as _time
     script_path = os.path.join(SCRIPT_DIR, script_name)
     if not os.path.exists(script_path):
         return {"error": f"Script {script_name} not found"}
 
     cmd = [sys.executable, script_path] + args + ["--json"]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        if result.returncode == 0 and result.stdout.strip():
-            return json.loads(result.stdout)
-        err_msg = result.stderr.strip() or f"Exit code {result.returncode}"
-        return {"error": f"[{script_name}] {err_msg}"}
-    except subprocess.TimeoutExpired:
-        return {"error": f"Script timed out after {timeout}s"}
-    except json.JSONDecodeError:
-        return {"error": "Invalid JSON output from script"}
-    except Exception as e:
-        return {"error": str(e)}
+    last_error: dict = {"error": "no attempt"}
+    for attempt in range(max_retries + 1):
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            if result.returncode == 0 and result.stdout.strip():
+                # Succes
+                return json.loads(result.stdout)
+            err_msg = result.stderr.strip() or f"Exit code {result.returncode}"
+            last_error = {"error": f"[{script_name}] {err_msg}"}
+        except subprocess.TimeoutExpired:
+            last_error = {"error": f"Script timed out after {timeout}s"}
+        except json.JSONDecodeError:
+            last_error = {"error": "Invalid JSON output from script"}
+        except Exception as e:
+            last_error = {"error": str(e)}
+
+        # Si dernier tour : retourner l'erreur, pas de retry
+        if attempt >= max_retries:
+            break
+        # Sinon : attendre 5 secondes puis reessayer
+        print(
+            f"  ⟳ {script_name} a echoue (tentative {attempt + 1}/{max_retries + 1}), "
+            f"retry dans 5s : {last_error.get('error', '')[:100]}",
+            file=sys.stderr,
+        )
+        _time.sleep(5)
+
+    return last_error
 
 
 def fetch_page(url: str) -> str:
