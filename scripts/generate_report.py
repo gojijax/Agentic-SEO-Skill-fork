@@ -181,7 +181,20 @@ def run_script(script_name: str, args: list, timeout: int = 120, max_retries: in
     last_error: dict = {"error": "no attempt"}
     for attempt in range(max_retries + 1):
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            # Fix 01/06 apres Meyson : forcer encoding=utf-8 errors=replace
+            # pour eviter le mojibake (double encodage UTF-8 -> cp1252)
+            # observe sur manufacturer_dup_check evidence : "rÃ©current"
+            # au lieu de "récurrent". Sans encoding=utf-8 explicite,
+            # subprocess.run text=True utilise locale par defaut qui sur
+            # Windows est cp1252 → corruption.
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                encoding="utf-8",
+                errors="replace",
+            )
             if result.returncode == 0 and result.stdout.strip():
                 # Succes
                 return json.loads(result.stdout)
