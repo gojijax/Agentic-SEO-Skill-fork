@@ -13,6 +13,7 @@ Usage:
 import argparse
 import hashlib
 import json
+import os
 import re
 import sys
 import time
@@ -171,10 +172,14 @@ def page_is_noindex(data: dict) -> bool:
 # Crawl
 # ---------------------------------------------------------------------------
 
-def crawl_site(start_url: str, max_pages: int = 50, depth: int = 2) -> dict:
+def crawl_site(start_url: str, max_pages: int = 100, depth: int = 2) -> dict:
     """
     Crawl a site starting from start_url.
     Returns {url: {"text": str, "word_count": int, "html": str}}.
+
+    Refonte 01/06 apres Nicolas : default 50 -> 100. Reste rapide car
+    fetch sequentiel mais sleep 0.5s -> 0.1s pour eviter de doubler le
+    temps de pipeline.
     """
     visited = {}
     queue = [(start_url, 0)]
@@ -182,7 +187,7 @@ def crawl_site(start_url: str, max_pages: int = 50, depth: int = 2) -> dict:
 
     while queue and len(visited) < max_pages:
         url, d = queue.pop(0)
-        time.sleep(0.5)  # polite delay
+        time.sleep(0.1)  # delay reduit pour passage de 50 a 100 pages
 
         html = fetch_page(url)
         if not html:
@@ -203,6 +208,45 @@ def crawl_site(start_url: str, max_pages: int = 50, depth: int = 2) -> dict:
                 if link not in seen and len(seen) < max_pages * 3:
                     seen.add(link)
                     queue.append((link, d + 1))
+
+    return visited
+
+
+def fetch_pages_from_urls(urls: list, max_workers: int = 10) -> dict:
+    """Fetch en parallele une liste d'URLs deja selectionnee (mode hybride
+    via --urls-file). Permet de cibler les fiches produits au lieu de
+    crawler depuis la home en BFS.
+
+    Ajoute 01/06 apres remontee Nicolas post-Meyson : le crawl BFS de
+    profondeur 2 partant de la home ne ramene pas assez de fiches
+    produits pour detecter de la duplication catalogue (sample mixte
+    home + categories + qq fiches). En mode hybride, on consomme les
+    URLs deja selectionnees par ECOM (product_strong + product_weak +
+    fiches outliers crawl) pour avoir un sample cible fiches.
+
+    Pas de BFS, pas de propagation : strictement les URLs fournies."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    visited = {}
+
+    def _fetch_one(url):
+        html = fetch_page(url)
+        if not html:
+            return url, None
+        text = extract_text(html)
+        word_count = len(re.findall(r"\b\w+\b", text))
+        return url, {
+            "text": text,
+            "word_count": word_count,
+            "html": html,
+            "noindex": html_has_noindex(html),
+        }
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_fetch_one, url): url for url in urls}
+        for fut in as_completed(futures):
+            url, data = fut.result()
+            if data is not None:
+                visited[url] = data
 
     return visited
 
@@ -314,11 +358,48 @@ def detect_duplicates(pages: dict, similarity_threshold: float = 0.85) -> dict:
                 "fix": f"Expand content to at least {threshold} words of substantive, unique content, or noindex if low-value.",
             })
 
+    # Construire un champ "issues" agregeant les 3 listes au format
+    # standard BHUNA (severity / finding / fix / evidence). Sans ce
+    # champ, generate_report.py _findings_from_section ne voyait rien
+    # parce qu'il boucle sur section_data["issues"] et duplicate_content
+    # sortait dans des cles propres. Resultat : 7 near-duplicate
+    # detectes sur Meyson mais 0 finding emis donc 0 action canonique.
+    # Ajout 01/06 apres F23a.
+    issues_aggregated: list = []
+    for ed in exact_dupes:
+        issues_aggregated.append({
+            "severity": ed.get("severity", "Critical"),
+            "finding": ed.get("finding", ""),
+            "evidence": (
+                f"URLs concernees : {', '.join(ed.get('urls', [])[:3])}"
+                + (" (+ autres)" if len(ed.get("urls", [])) > 3 else "")
+            ),
+            "fix": ed.get("fix", ""),
+        })
+    for nd in near_dupes:
+        issues_aggregated.append({
+            "severity": nd.get("severity", "Warning"),
+            "finding": nd.get("finding", ""),
+            "evidence": (
+                f"{nd.get('url_a','')} vs {nd.get('url_b','')} "
+                f"({nd.get('word_count_a','?')} vs {nd.get('word_count_b','?')} mots)"
+            ),
+            "fix": nd.get("fix", ""),
+        })
+    for tp in thin_pages:
+        issues_aggregated.append({
+            "severity": tp.get("severity", "Warning"),
+            "finding": tp.get("finding", ""),
+            "evidence": tp.get("url", ""),
+            "fix": tp.get("fix", ""),
+        })
+
     return {
         "pages_analyzed": len(pages),
         "exact_duplicates": exact_dupes,
         "near_duplicates": near_dupes,
         "thin_content": thin_pages,
+        "issues": issues_aggregated,
         "summary": {
             "exact_duplicate_groups": len(exact_dupes),
             "near_duplicate_pairs": len(near_dupes),
@@ -340,15 +421,77 @@ def main():
     )
     parser.add_argument("url", help="Start URL to crawl")
     parser.add_argument("--depth", type=int, default=2, help="Crawl depth (default: 2)")
-    parser.add_argument("--max-pages", type=int, default=50, help="Max pages to crawl (default: 50)")
+    parser.add_argument("--max-pages", type=int, default=100, help="Max pages to crawl (default: 100)")
     parser.add_argument("--threshold", type=float, default=0.85,
                         help="Jaccard similarity threshold for near-duplicates (default: 0.85)")
+    parser.add_argument("--urls-file", default=None,
+                        help="Optionnel : path vers 01-ECOM-urls.json. Si fourni, le script "
+                             "n'effectue PAS son crawl BFS et utilise les URLs typees "
+                             "(product_strong, product_weak, product) deja selectionnees "
+                             "par ECOM. Sample cible fiches au lieu de BFS aleatoire.")
     parser.add_argument("--json", action="store_true", help="Output as JSON")
     args = parser.parse_args()
 
-    print(f"Crawling {args.url} (depth={args.depth}, max={args.max_pages})...", file=sys.stderr)
-    pages = crawl_site(args.url, max_pages=args.max_pages, depth=args.depth)
-    print(f"Crawled {len(pages)} pages. Analyzing...", file=sys.stderr)
+    # Mode hybride (ajout 01/06 apres Meyson) : si --urls-file fourni,
+    # on consomme les URLs ECOM au lieu de crawler. Cible fiches produits
+    # + croisement avec outliers crawl si dispo.
+    if args.urls_file and os.path.exists(args.urls_file):
+        try:
+            with open(args.urls_file, "r", encoding="utf-8") as f:
+                urls_data = json.load(f)
+            # Filtre : types produits + categories + home (= ce que ECOM a
+            # selectionne, ~22 URLs typiquement)
+            wanted_types = {"product_strong", "product_weak", "product",
+                            "category", "category_opportunity", "home"}
+            urls_to_fetch = [
+                entry.get("url") for entry in urls_data.get("urls", [])
+                if entry.get("url") and entry.get("type") in wanted_types
+            ]
+            # Croisement avec les outliers crawl si 04-CRAWL-stats.json est
+            # a cote : ajoute jusqu'a 80 fiches supplementaires depuis
+            # thin_product_pages + home_lookalike_pages pour atteindre ~100
+            urls_dir = os.path.dirname(os.path.abspath(args.urls_file))
+            crawl_stats_path = os.path.join(urls_dir, "04-CRAWL-stats.json")
+            if not os.path.exists(crawl_stats_path):
+                # Essai chemin parent (cas urls.json dans subdir temp)
+                parent = os.path.dirname(urls_dir)
+                crawl_stats_path = os.path.join(parent, "04-CRAWL-stats.json")
+            if os.path.exists(crawl_stats_path):
+                try:
+                    with open(crawl_stats_path, "r", encoding="utf-8") as f:
+                        crawl_stats = json.load(f)
+                    seen = set(urls_to_fetch)
+                    outliers = (crawl_stats.get("stats", {}) or {}).get("outliers", {}) or {}
+                    extra_targets = ["thin_product_pages", "home_lookalike_pages"]
+                    extra_quota = max(0, args.max_pages - len(urls_to_fetch))
+                    for key in extra_targets:
+                        if extra_quota <= 0:
+                            break
+                        out = outliers.get(key) or {}
+                        for s in (out.get("sample") or [])[:extra_quota]:
+                            u = s if isinstance(s, str) else s.get("url")
+                            if u and u not in seen:
+                                seen.add(u)
+                                urls_to_fetch.append(u)
+                                extra_quota -= 1
+                                if extra_quota <= 0:
+                                    break
+                except (OSError, json.JSONDecodeError):
+                    pass
+
+            urls_to_fetch = urls_to_fetch[: args.max_pages]
+            print(f"Mode hybride : fetch parallele de {len(urls_to_fetch)} URLs depuis "
+                  f"{os.path.basename(args.urls_file)} + outliers crawl...", file=sys.stderr)
+            pages = fetch_pages_from_urls(urls_to_fetch)
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"WARN : impossible de lire {args.urls_file} ({exc}), fallback crawl BFS.",
+                  file=sys.stderr)
+            pages = crawl_site(args.url, max_pages=args.max_pages, depth=args.depth)
+    else:
+        print(f"Crawling {args.url} (depth={args.depth}, max={args.max_pages})...", file=sys.stderr)
+        pages = crawl_site(args.url, max_pages=args.max_pages, depth=args.depth)
+
+    print(f"Analyzed {len(pages)} pages. Detecting duplicates...", file=sys.stderr)
 
     report = detect_duplicates(pages, similarity_threshold=args.threshold)
 

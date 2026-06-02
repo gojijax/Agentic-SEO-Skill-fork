@@ -661,7 +661,13 @@ def collect_data(url: str, urls_file: str | None = None) -> dict:
         ("internal_links", "internal_links.py", [url, "--depth", "1", "--max-pages", "15"]),
         ("link_profile", "link_profile.py", [url, "--max-pages", "20"]),
         ("hreflang", "hreflang_checker.py", [url]),
-        ("duplicate_content", "duplicate_content.py", [url]),
+        # duplicate_content : en mode hybride (urls_file fourni), passer
+        # --urls-file pour que le script cible les fiches produits ECOM
+        # + outliers crawl au lieu de faire son BFS depuis la home
+        # (sample mixte peu utile pour duplication catalogue).
+        # Ajout 01/06 apres Meyson.
+        ("duplicate_content", "duplicate_content.py",
+            ([url, "--urls-file", urls_file] if urls_file else [url])),
         ("url_quality", "url_quality.py", url_quality_args),
         # E-commerce-specific enrichment scripts (site-level part)
         ("canonical", "canonical_checker.py", url_quality_args),
