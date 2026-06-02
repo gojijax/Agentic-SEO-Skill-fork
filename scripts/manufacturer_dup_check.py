@@ -111,7 +111,10 @@ UI_GENERIC_WORDS = {
     "créer un compte", "mot de passe", "adresse email", "loading",
 }
 DEFAULT_SNIPPET_LEN = 180
-DEFAULT_MAX_URLS = 5
+DEFAULT_MAX_URLS = 20  # Etendu 01/06 (avant : 5) : couple avec sample
+                       # ECOM passe a 10+10 fiches. Permet une vraie
+                       # gradation severity (10+/20 = Critical) au lieu
+                       # d'un sample de 5 qui plafonnait a Important.
 DEFAULT_THRESHOLD = 5
 PRODUCT_TYPES = {"product_strong", "product_weak", "product"}
 
