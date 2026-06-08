@@ -777,12 +777,23 @@ def run(urls_file: str, max_urls: int, snippet_len: int, threshold: int,
             issues.append({
                 "severity": severity,
                 "area": "manufacturer_dup_check",
+                # F58e-bis (09/06) : URL retiree du texte finding et
+                # mise dans _urls. Avant, le finding contenait
+                # "URL : {url}" en fin de phrase, ce qui faisait
+                # tronquer l'URL a "URL : ht..." cote builder
+                # bhuna_actions_builder (qui cap le title a 200 chars).
+                # Maintenant, l'URL est dans _urls qui est lu par le
+                # builder pour remplir page_concernee/pages_concerned_sample
+                # correctement. Le texte finding ne mentionne plus l'URL
+                # directement (la fiche concernee est visible dans
+                # l'echantillon de pages cote Notion).
                 "finding": (
-                    f"Description produit : {unique_count} domaine(s) tiers reprennent au moins "
-                    f"une phrase de votre fiche. Parmi eux, {len(recurrent)} domaine(s) "
-                    f"récurrent(s) partagent ≥2 phrases distinctes — signal robuste de "
-                    f"duplication. URL : {record['url']}"
+                    f"Description produit reprise sur {unique_count} site(s) tiers. "
+                    f"Parmi eux, {len(recurrent)} site(s) recurrent(s) "
+                    f"partagent au moins 2 phrases distinctes, signal robuste "
+                    "de duplication."
                 ),
+                "_urls": [record["url"]],
                 "evidence": (
                     f"Domaines récurrents : {recurrent_str}. "
                     f"Échantillon des autres domaines (1 phrase commune) : {other_sample[:200]}. "
