@@ -396,6 +396,137 @@ def _dataforseo_serp(snippet: str, login: str, password: str, timeout: int = 30)
     return payload
 
 
+# F88 (11/06) : Standard Queue (priority=1, ~5min de latence) au lieu
+# de Live Mode (~6s) — divise le cout par 3 ($0.0006 vs $0.002 par
+# appel). Mode batch : POST tous les snippets d'un coup au debut,
+# attendre que les tasks soient pretes, GET les resultats en bloc.
+
+def _dataforseo_creds_header(login: str, password: str) -> dict:
+    creds = base64.b64encode(f"{login}:{password}".encode("utf-8")).decode("ascii")
+    return {"Authorization": f"Basic {creds}", "Content-Type": "application/json"}
+
+
+def _dataforseo_task_post_batch(
+    snippets: list[str], login: str, password: str, timeout: int = 30,
+) -> list:
+    """POST un batch de tasks Standard Queue. Retourne la liste des
+    task_ids (un par snippet, dans l'ordre). Si une task ne se cree
+    pas, l'entree est None.
+
+    DataForSEO accepte jusqu'a 100 tasks par requete POST.
+    """
+    headers = _dataforseo_creds_header(login, password)
+    task_ids: list = []
+    # Chunk de 100 par appel POST (limite API DataForSEO).
+    for i in range(0, len(snippets), 100):
+        chunk = snippets[i:i + 100]
+        body = [
+            {
+                "language_code": "fr",
+                "location_code": 2250,
+                "keyword": f'"{s}"',
+                "depth": 20,
+                "device": "desktop",
+                "priority": 1,
+            }
+            for s in chunk
+        ]
+        resp = safe_post(DATAFORSEO_TASK_POST, headers=headers, json=body, timeout=timeout)
+        payload = resp.json()
+        top_code = payload.get("status_code")
+        if resp.status_code >= 400 or (isinstance(top_code, int) and top_code >= 40000):
+            raise RuntimeError(
+                f"DataForSEO task_post HTTP {resp.status_code} / status_code "
+                f"{top_code}: {payload.get('status_message')}"
+            )
+        for task in payload.get("tasks") or []:
+            tcode = task.get("status_code")
+            if isinstance(tcode, int) and tcode >= 40000:
+                task_ids.append(None)
+            else:
+                task_ids.append(task.get("id"))
+    return task_ids
+
+
+def _dataforseo_tasks_ready_set(login: str, password: str, timeout: int = 30) -> set:
+    """Retourne l'ensemble des task_ids disponibles pour retrieval."""
+    headers = _dataforseo_creds_header(login, password)
+    resp = safe_get(DATAFORSEO_TASKS_READY, headers=headers, timeout=timeout)
+    payload = resp.json()
+    ready: set = set()
+    for outer in payload.get("tasks") or []:
+        for item in outer.get("result") or []:
+            tid = item.get("id")
+            if tid:
+                ready.add(tid)
+    return ready
+
+
+def _dataforseo_task_get(task_id: str, login: str, password: str, timeout: int = 30) -> dict:
+    """GET le resultat d'une task SERP standard queue."""
+    headers = _dataforseo_creds_header(login, password)
+    url = f"{DATAFORSEO_TASK_GET}/{task_id}"
+    resp = safe_get(url, headers=headers, timeout=timeout)
+    return resp.json()
+
+
+def _dataforseo_wait_and_collect(
+    task_ids: list,
+    login: str,
+    password: str,
+    poll_interval: int = 30,
+    max_wait: int = 1800,
+    log_progress: bool = True,
+) -> dict:
+    """Poll /tasks_ready jusqu'a ce que tous les task_ids soient pretes
+    (ou que max_wait soit atteint), puis GET chaque resultat.
+
+    Retourne un dict {task_id: serp_response_payload}. Les tasks qui
+    n'ont pas pu etre fetchees apparaissent avec valeur None.
+    """
+    pending = set(t for t in task_ids if t)
+    if not pending:
+        return {}
+    import time as _time
+    elapsed = 0
+    ready_collected: set = set()
+    results: dict = {}
+    while elapsed < max_wait and pending - ready_collected:
+        try:
+            ready = _dataforseo_tasks_ready_set(login, password)
+        except Exception as exc:
+            if log_progress:
+                print(f"[manufacturer_dup_check] tasks_ready poll failed: {exc}", file=sys.stderr)
+            ready = set()
+        newly = (ready & pending) - ready_collected
+        for tid in newly:
+            try:
+                results[tid] = _dataforseo_task_get(tid, login, password)
+            except Exception as exc:
+                if log_progress:
+                    print(f"[manufacturer_dup_check] task_get {tid} failed: {exc}", file=sys.stderr)
+                results[tid] = None
+            ready_collected.add(tid)
+        if pending - ready_collected:
+            if log_progress:
+                remaining = len(pending - ready_collected)
+                print(
+                    f"[manufacturer_dup_check] standard queue: {len(ready_collected)}/{len(pending)} ready, "
+                    f"{remaining} pending, +{elapsed}s",
+                    file=sys.stderr,
+                )
+            _time.sleep(poll_interval)
+            elapsed += poll_interval
+    # Tasks restantes non pretes : on essaie quand meme le task_get
+    # (peut-etre dispo malgre la non-apparition dans tasks_ready).
+    for tid in pending - ready_collected:
+        try:
+            results[tid] = _dataforseo_task_get(tid, login, password)
+        except Exception:
+            results[tid] = None
+    return results
+
+
 # --- Niveau 2 : validation HTML brut (refonte 29/05/2026) ---
 #
 # DataForSEO SERP est un endpoint de tracking, pas de detection de duplication.
@@ -611,8 +742,78 @@ def _parse_serp_response(payload: dict, audited_domain: str) -> dict:
     return result
 
 
+def _select_random_crawl_products(
+    crawl_pages_file: str,
+    urls_meta: dict,
+    sample_size: int,
+) -> list:
+    """F88 (11/06) : selectionne `sample_size` fiches produit aleatoires
+    depuis le crawl complet, en excluant celles deja presentes dans
+    Haloscan (urls_meta) qui rankent deja sur des requetes commerciales.
+
+    Le but est d'avoir un echantillon representatif du long-tail du
+    catalogue, plus pertinent pour detecter du duplicate descriptions
+    que les top fiches qui performent deja malgre tout.
+
+    Format attendu de 04-CRAWL-pages.jsonl : 1 JSON par ligne avec
+    au moins {url, status_code, content_type (ou indexable)}.
+    """
+    import random
+    halo_urls = {
+        e.get("url") for e in (urls_meta.get("urls") or [])
+        if isinstance(e, dict) and e.get("haloscan_source") == "best_pages"
+    }
+    audited_domain = (urls_meta.get("domain") or "").lower().removeprefix("www.")
+    # Heuristique URL produit pour les CMS courants (PrestaShop, Shopify,
+    # WooCommerce, custom). On filtre sur les patterns qui sortent
+    # presque toujours d'une fiche produit. Le crawl peut etre tres
+    # bruite (categories, pages techniques, etc.).
+    product_url_patterns = [
+        re.compile(r"/produit[s]?/", re.IGNORECASE),
+        re.compile(r"/product[s]?/", re.IGNORECASE),
+        re.compile(r"-p\d+\.html?$", re.IGNORECASE),
+        re.compile(r"-pid-\d+", re.IGNORECASE),
+        re.compile(r"/article[s]?/", re.IGNORECASE),
+        re.compile(r"-f\d+\.html?$", re.IGNORECASE),  # PrestaShop fiche
+        re.compile(r"-\d{3,}-?\d*\.html?$"),           # PrestaShop product ID
+    ]
+    candidates: list = []
+    try:
+        with open(crawl_pages_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    page = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                url = page.get("url")
+                if not url or url in halo_urls:
+                    continue
+                status = page.get("status_code") or page.get("status")
+                if status and isinstance(status, int) and (status < 200 or status >= 400):
+                    continue
+                netloc = urlparse(url).netloc.lower().removeprefix("www.")
+                if audited_domain and netloc != audited_domain:
+                    continue
+                if not any(p.search(url) for p in product_url_patterns):
+                    continue
+                candidates.append({"url": url, "type": "product_crawl_sample"})
+    except OSError:
+        return []
+    if not candidates:
+        return []
+    # Tirage aleatoire pseudo-deterministe par seed du domaine (audit
+    # reproductible). Si reproductibilite non requise, utiliser random.
+    rng = random.Random(audited_domain or "fallback")
+    rng.shuffle(candidates)
+    return candidates[:sample_size]
+
+
 def run(urls_file: str, max_urls: int, snippet_len: int, threshold: int,
-        timeout: int = 12) -> dict:
+        timeout: int = 12, crawl_pages_file: str = None,
+        sample_size: int = 50, use_standard_queue: bool = True) -> dict:
     load_env()
     login = get_env("DATAFORSEO_LOGIN")
     password = get_env("DATAFORSEO_PASSWORD")
@@ -656,13 +857,37 @@ def run(urls_file: str, max_urls: int, snippet_len: int, threshold: int,
                 audited_domain = urlparse(entry["url"]).netloc.lower().removeprefix("www.")
                 break
 
-    products = [
-        entry for entry in urls_meta.get("urls", [])
-        if isinstance(entry, dict) and entry.get("type") in PRODUCT_TYPES and entry.get("url")
-    ]
-    products = products[:max_urls]
+    # F88 (11/06) : selection des fiches a scanner.
+    # - Si crawl_pages_file fourni : sample aleatoire de `sample_size`
+    #   fiches du crawl (en excluant celles deja dans Haloscan best_pages).
+    #   Plus pertinent pour detecter le duplicate sur le long-tail.
+    # - Sinon : fallback historique = top `max_urls` fiches d'urls.json
+    #   (qui rankent deja sur Haloscan).
+    if crawl_pages_file and os.path.exists(crawl_pages_file):
+        products = _select_random_crawl_products(
+            crawl_pages_file, urls_meta, sample_size,
+        )
+        if not products:
+            print(
+                f"[manufacturer_dup_check] crawl sample empty, fallback "
+                f"sur urls.json",
+                file=sys.stderr,
+            )
+            products = [
+                entry for entry in urls_meta.get("urls", [])
+                if isinstance(entry, dict)
+                and entry.get("type") in PRODUCT_TYPES
+                and entry.get("url")
+            ][:max_urls]
+    else:
+        products = [
+            entry for entry in urls_meta.get("urls", [])
+            if isinstance(entry, dict)
+            and entry.get("type") in PRODUCT_TYPES
+            and entry.get("url")
+        ][:max_urls]
     if not products:
-        return {"skipped": True, "reason": "no product URLs in urls.json", "checked": []}
+        return {"skipped": True, "reason": "no product URLs found", "checked": []}
 
     checked: list[dict] = []
     suspect_count = 0
@@ -670,9 +895,82 @@ def run(urls_file: str, max_urls: int, snippet_len: int, threshold: int,
     # BSD ont les memes concurrents dans leur SERP, on ne fetch chaque URL
     # tierce qu'une seule fois.
     html_cache: dict[str, str | None] = {}
+
+    # F88 (11/06) : pre-pass pour collecter tous les snippets de toutes
+    # les fiches, puis POST en batch Standard Queue si active. Le mapping
+    # snippet -> SERP response est utilise dans la boucle principale au
+    # lieu d'un appel synchrone par snippet.
+    print(
+        f"[manufacturer_dup_check] phase 1/3 : fetch {len(products)} fiches "
+        f"+ extraction snippets...",
+        file=sys.stderr,
+    )
+    fetched_pages = []
     for entry in products:
+        page = _fetch_snippet(
+            entry["url"], snippet_len, timeout=timeout, cms_hint=cms_hint,
+        )
+        fetched_pages.append((entry, page))
+
+    snippet_to_response: dict = {}
+    if use_standard_queue:
+        # Collecter tous les snippets uniques de toutes les fiches.
+        all_snippets_set: set = set()
+        for _, page in fetched_pages:
+            for s in (page.get("snippets") or []):
+                if s:
+                    all_snippets_set.add(s)
+            if page.get("snippet"):
+                all_snippets_set.add(page["snippet"])
+        all_snippets = sorted(all_snippets_set)
+        if all_snippets:
+            print(
+                f"[manufacturer_dup_check] phase 2/3 : Standard Queue, POST "
+                f"{len(all_snippets)} snippets uniques ($0.0006/snippet, latence ~5min)...",
+                file=sys.stderr,
+            )
+            try:
+                task_ids = _dataforseo_task_post_batch(
+                    all_snippets, login, password,
+                )
+                snippet_to_task = {
+                    s: t for s, t in zip(all_snippets, task_ids) if t
+                }
+                print(
+                    f"[manufacturer_dup_check] {len(snippet_to_task)}/{len(all_snippets)} "
+                    f"tasks posted, polling tasks_ready...",
+                    file=sys.stderr,
+                )
+                task_results = _dataforseo_wait_and_collect(
+                    list(snippet_to_task.values()),
+                    login, password,
+                    poll_interval=30, max_wait=1800,
+                )
+                snippet_to_response = {
+                    snip: task_results.get(tid)
+                    for snip, tid in snippet_to_task.items()
+                }
+                ready_count = sum(1 for v in snippet_to_response.values() if v)
+                print(
+                    f"[manufacturer_dup_check] phase 2/3 done : "
+                    f"{ready_count}/{len(snippet_to_task)} snippets recoltes",
+                    file=sys.stderr,
+                )
+            except Exception as exc:
+                print(
+                    f"[manufacturer_dup_check] Standard Queue failed, fallback "
+                    f"sur Live Mode synchrone : {exc}",
+                    file=sys.stderr,
+                )
+                snippet_to_response = {}
+
+    print(
+        f"[manufacturer_dup_check] phase 3/3 : N2 validation HTML des "
+        f"candidats SERP...",
+        file=sys.stderr,
+    )
+    for entry, page in fetched_pages:
         url = entry["url"]
-        page = _fetch_snippet(url, snippet_len, timeout=timeout, cms_hint=cms_hint)
         snippets_tried = page.get("snippets") or ([page["snippet"]] if page.get("snippet") else [])
         record = {
             "url": url,
@@ -708,7 +1006,12 @@ def run(urls_file: str, max_urls: int, snippet_len: int, threshold: int,
             for snip in snippets_tried:
                 snip_normalized = _normalize_for_match(snip)
                 try:
-                    response = _dataforseo_serp(snip, login, password)
+                    # F88 (11/06) : si le batch Standard Queue a pre-recolte
+                    # une reponse pour ce snippet, l'utiliser. Sinon, retomber
+                    # sur l'appel synchrone Live Mode.
+                    response = snippet_to_response.get(snip)
+                    if response is None:
+                        response = _dataforseo_serp(snip, login, password)
                     parsed = _parse_serp_response(response, audited_domain)
                     statuses.append(parsed["raw_status"] or "ok")
                     n1_candidates = parsed["items"]
@@ -955,9 +1258,33 @@ def main() -> None:
     parser.add_argument("--threshold", type=int, default=DEFAULT_THRESHOLD,
                         help=f"Min external domains to flag suspect (default: {DEFAULT_THRESHOLD})")
     parser.add_argument("--output", default=None, help="Write JSON to this path instead of stdout")
+    # F88 (11/06) : nouveaux flags pour la selection 50 fiches crawl
+    # aleatoires et le mode Standard Queue ($0.0006 vs $0.002 par appel).
+    parser.add_argument(
+        "--crawl-pages-file", default=None,
+        help="Path to 04-CRAWL-pages.jsonl. Si fourni, sample aleatoire de "
+             "--sample-size fiches du crawl (en excluant les top fiches "
+             "Haloscan deja en best_pages). Si absent, comportement historique "
+             "(top --max-urls fiches d'urls.json).",
+    )
+    parser.add_argument(
+        "--sample-size", type=int, default=50,
+        help="Taille du sample aleatoire crawl (default: 50). Ignore si "
+             "--crawl-pages-file n'est pas fourni.",
+    )
+    parser.add_argument(
+        "--use-live", action="store_true",
+        help="Force Live Mode (synchrone, ~6s/appel, $0.002). Par defaut "
+             "Standard Queue (batch async, ~5min, $0.0006/appel).",
+    )
     args = parser.parse_args()
 
-    result = run(args.urls_file, args.max_urls, args.snippet_length, args.threshold)
+    result = run(
+        args.urls_file, args.max_urls, args.snippet_length, args.threshold,
+        crawl_pages_file=args.crawl_pages_file,
+        sample_size=args.sample_size,
+        use_standard_queue=not args.use_live,
+    )
     payload = json.dumps(result, ensure_ascii=False, indent=2)
     if args.output:
         with open(args.output, "w", encoding="utf-8") as f:
