@@ -658,6 +658,7 @@ def run(urls_file: str, max_urls: int, snippet_len: int, threshold: int,
                     # presence litterale de la phrase. Seuls les valides
                     # comptent dans domain_hits.
                     validated_domains: set[str] = set()
+                    validated_urls_by_domain: dict = {}
                     for cand in n1_candidates:
                         check = _validate_match_in_html(
                             cand["url"], snip_normalized, html_cache,
@@ -665,6 +666,15 @@ def run(urls_file: str, max_urls: int, snippet_len: int, threshold: int,
                         )
                         if check["valid"]:
                             validated_domains.add(cand["domain"])
+                            # F87 (11/06) : conserver l'URL exacte du
+                            # candidat valide. Avant on ne gardait que
+                            # le domaine, ce qui forcait le builder a
+                            # mettre la home du concurrent dans le
+                            # finding ("partage avec naturabuy.fr") au
+                            # lieu de l'URL precise de la page tierce.
+                            validated_urls_by_domain.setdefault(
+                                cand["domain"], []
+                            ).append(cand["url"])
                             record["n2_validated"] += 1
                         else:
                             record["n2_rejected"].append({
@@ -677,6 +687,14 @@ def run(urls_file: str, max_urls: int, snippet_len: int, threshold: int,
                         matched_snippets += 1
                     for d in validated_domains:
                         domain_hits[d] = domain_hits.get(d, 0) + 1
+                        # F87 : accumuler les URLs validees par domaine
+                        # au niveau du record, pour pouvoir les afficher
+                        # dans le finding consolide.
+                        record.setdefault("validated_urls_by_domain", {})
+                        record["validated_urls_by_domain"].setdefault(d, [])
+                        for u in validated_urls_by_domain.get(d, []):
+                            if u not in record["validated_urls_by_domain"][d]:
+                                record["validated_urls_by_domain"][d].append(u)
                     record["per_snippet_results"].append({
                         "snippet": snip[:80],
                         "n1_candidates": len(n1_candidates),
@@ -712,8 +730,17 @@ def run(urls_file: str, max_urls: int, snippet_len: int, threshold: int,
 
             record["external_domains_count"] = total_unique
             record["external_domains_sample"] = sorted(domain_hits.keys())[:10]
+            # F87 (11/06) : exposer les URLs exactes des pages tierces
+            # validees, par domaine recurrent. Permet au finding
+            # consolide de pointer vers l'URL precise de la fiche
+            # concurrente / fabricant au lieu du seul nom de domaine.
+            validated_urls_map = record.get("validated_urls_by_domain") or {}
             record["recurrent_domains"] = [
-                {"domain": d, "matched_snippets": domain_hits[d]}
+                {
+                    "domain": d,
+                    "matched_snippets": domain_hits[d],
+                    "urls": validated_urls_map.get(d, [])[:5],
+                }
                 for d in recurrent[:10]
             ]
             record["matched_snippets"] = matched_snippets
@@ -774,6 +801,15 @@ def run(urls_file: str, max_urls: int, snippet_len: int, threshold: int,
             severity = "warning"
             many_recurrent = len(recurrent) >= 2
 
+            # F87 (11/06) : structurer les URLs tierces par domaine
+            # pour permettre au builder de citer l'URL precise de la
+            # page concurrente / fabricant au lieu du seul nom de
+            # domaine. La liste est limitee a 3 URLs par domaine pour
+            # eviter de polluer l'evidence.
+            external_urls_by_domain = {
+                rd["domain"]: rd.get("urls", [])[:3]
+                for rd in record.get("recurrent_domains", [])
+            }
             issues.append({
                 "severity": severity,
                 "area": "manufacturer_dup_check",
@@ -794,6 +830,7 @@ def run(urls_file: str, max_urls: int, snippet_len: int, threshold: int,
                     "de duplication."
                 ),
                 "_urls": [record["url"]],
+                "_external_urls_by_domain": external_urls_by_domain,
                 "evidence": (
                     f"Domaines récurrents : {recurrent_str}. "
                     f"Échantillon des autres domaines (1 phrase commune) : {other_sample[:200]}. "
