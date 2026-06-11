@@ -51,6 +51,30 @@ except ImportError:
 
 
 DATAFORSEO_ENDPOINT = "https://api.dataforseo.com/v3/serp/google/organic/live/advanced"
+# F88 (11/06) : endpoints Standard Queue (task_post / tasks_ready /
+# task_get) pour passer de $0.002/appel (Live) a $0.0006/appel
+# (Standard, 5 min de latence). Sur un audit en background qui tourne
+# 30-60 min, 5 min de plus est imperceptible.
+DATAFORSEO_TASK_POST = "https://api.dataforseo.com/v3/serp/google/organic/task_post"
+DATAFORSEO_TASKS_READY = "https://api.dataforseo.com/v3/serp/google/organic/tasks_ready"
+DATAFORSEO_TASK_GET = "https://api.dataforseo.com/v3/serp/google/organic/task_get/advanced"
+
+# F88 (11/06) : blocklist des marketplaces et sites d'annonces qui
+# republient verbatim le texte fabricant. Faux positifs structurels :
+# une fiche revendeur qui copie le fabricant matche aussi sur eBay /
+# NaturaBuy parce que le vendeur copie aussi le fabricant. Ce n'est
+# pas un signal de duplication concurrentielle utile.
+MARKETPLACE_BLOCKLIST = frozenset({
+    "naturabuy.fr",
+    "ebay.fr", "ebay.com",
+    "leboncoin.fr",
+    "amazon.fr", "amazon.com",
+    "cdiscount.com",
+    "rakuten.fr", "rakuten.com",
+    "fnac.com",
+    "vinted.fr",
+    "aliexpress.com", "aliexpress.fr",
+})
 
 NOISE_TAGS = ("nav", "header", "footer", "aside", "script", "style", "noscript")
 NOISE_CLASSES = (
@@ -494,29 +518,64 @@ def _validate_match_in_html(
     if snippet_normalized in page_text_normalized:
         return {"valid": True, "reason": "exact_match", "url": candidate_url}
 
-    # Fallback fuzzy : >= 12 mots consecutifs significatifs identiques.
+    # Fallback fuzzy : decoupe le snippet en tokens significatifs et
+    # cherche une fenetre du HTML candidat qui contient >= TOKEN_OVERLAP_RATIO
+    # de ces tokens. Tolere le paraphrasing fabricant (1-2 mots changes,
+    # ordre legerement different) que le check 12-mots-consecutifs ratait.
+    # Cas observe Beaurepaire 11/06 : browning.eu remonte par Google comme
+    # candidat sur la phrase Beaurepaire mais rejete en fuzzy strict.
     snippet_words = [w for w in snippet_normalized.split() if len(w) >= 4]
-    if len(snippet_words) < _FUZZY_MIN_CONSECUTIVE_WORDS:
+    if len(snippet_words) < 6:
         return {"valid": False, "reason": "phrase_absent_short_snippet", "url": candidate_url}
 
     page_words = page_text_normalized.split()
+    if not page_words:
+        return {"valid": False, "reason": "empty_page", "url": candidate_url}
+
+    # F88 (11/06) : token-overlap dans une fenetre glissante.
+    # - taille fenetre = 1.5 * len(snippet_words) pour absorber les insertions
+    # - seuil = 70% des tokens du snippet presents dans la fenetre
+    snippet_token_set = set(snippet_words)
+    window_size = max(int(len(snippet_words) * 1.5), len(snippet_words))
+    threshold = max(int(len(snippet_words) * 0.70), 5)
+
+    # Index inverse : pour chaque token, ses positions dans la page.
     page_set_index: dict[str, list[int]] = {}
     for i, w in enumerate(page_words):
-        page_set_index.setdefault(w, []).append(i)
+        if w in snippet_token_set:
+            page_set_index.setdefault(w, []).append(i)
 
-    # Fenetre glissante : pour chaque position de depart du snippet, chercher
-    # si une fenetre de N mots consecutifs apparait dans la page.
-    n = _FUZZY_MIN_CONSECUTIVE_WORDS
-    for start_pos in range(0, len(snippet_words) - n + 1):
-        window = snippet_words[start_pos:start_pos + n]
-        first_word = window[0]
-        candidates_pos = page_set_index.get(first_word, [])
-        for p in candidates_pos:
-            if p + n > len(page_words):
+    # Toutes les positions ou un token du snippet apparait, ordonnees.
+    hit_positions = sorted({p for ps in page_set_index.values() for p in ps})
+    if len(hit_positions) < threshold:
+        return {
+            "valid": False,
+            "reason": f"phrase_absent_fuzzy (overlap {len(hit_positions)}/{len(snippet_words)})",
+            "url": candidate_url,
+        }
+
+    # Pour chaque position de depart, compter combien de tokens distincts
+    # du snippet apparaissent dans la fenetre [p, p+window_size].
+    for start in hit_positions:
+        end = start + window_size
+        tokens_in_window = set()
+        for p in hit_positions:
+            if p < start:
                 continue
-            if page_words[p:p + n] == window:
-                return {"valid": True, "reason": f"fuzzy_match_{n}_words", "url": candidate_url}
-    return {"valid": False, "reason": "phrase_absent_fuzzy", "url": candidate_url}
+            if p >= end:
+                break
+            tokens_in_window.add(page_words[p])
+        if len(tokens_in_window) >= threshold:
+            return {
+                "valid": True,
+                "reason": f"fuzzy_overlap_{len(tokens_in_window)}/{len(snippet_words)}",
+                "url": candidate_url,
+            }
+    return {
+        "valid": False,
+        "reason": f"phrase_absent_fuzzy (max overlap in window < {threshold})",
+        "url": candidate_url,
+    }
 
 
 def _parse_serp_response(payload: dict, audited_domain: str) -> dict:
@@ -660,6 +719,18 @@ def run(urls_file: str, max_urls: int, snippet_len: int, threshold: int,
                     validated_domains: set[str] = set()
                     validated_urls_by_domain: dict = {}
                     for cand in n1_candidates:
+                        # F88 (11/06) : exclure les marketplaces et sites
+                        # d'annonces qui republient le texte fabricant
+                        # verbatim. Faux positifs structurels sans valeur
+                        # de signal concurrentiel.
+                        if cand["domain"].lower() in MARKETPLACE_BLOCKLIST:
+                            record["n2_rejected"].append({
+                                "domain": cand["domain"],
+                                "url": cand["url"],
+                                "snippet_excerpt": snip[:60],
+                                "reason": "marketplace_blocklist",
+                            })
+                            continue
                         check = _validate_match_in_html(
                             cand["url"], snip_normalized, html_cache,
                             timeout=timeout,
