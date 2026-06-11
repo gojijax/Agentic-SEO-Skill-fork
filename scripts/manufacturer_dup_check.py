@@ -382,7 +382,8 @@ def _dataforseo_serp(snippet: str, login: str, password: str, timeout: int = 30)
         "language_code": "fr",
         "location_code": 2250,  # France
         "keyword": f'"{snippet}"',
-        "depth": 20,
+        "depth": 10,  # F88bis : reduit de 20 a 10 pour limiter les
+                      # candidats a fetcher en phase N2 (-30%)
         "device": "desktop",
     }]
     resp = safe_post(DATAFORSEO_ENDPOINT, headers=headers, json=body, timeout=timeout)
@@ -425,7 +426,7 @@ def _dataforseo_task_post_batch(
                 "language_code": "fr",
                 "location_code": 2250,
                 "keyword": f'"{s}"',
-                "depth": 20,
+                "depth": 10,
                 "device": "desktop",
                 "priority": 1,
             }
@@ -592,6 +593,8 @@ def _validate_match_in_html(
     snippet_normalized: str,
     html_cache: dict[str, str | None],
     timeout: int = 8,
+    last_fetch_by_domain: dict = None,
+    min_interval_per_domain: float = 0.5,
 ) -> dict:
     """Niveau 2 : verifier que la phrase recherchee apparait litteralement
     dans le HTML de l'URL candidate.
@@ -616,6 +619,18 @@ def _validate_match_in_html(
         if cached_html is None:
             return {"valid": False, "reason": "fetch_error (cached)", "url": candidate_url}
     else:
+        # F88bis : throttle per-domain pour eviter le blocage sur les
+        # sites tiers qui apparaissent dans plusieurs SERP. ~0.5s entre
+        # 2 fetches sur le meme domaine.
+        if last_fetch_by_domain is not None:
+            import time as _tm
+            netloc = urlparse(candidate_url).netloc.lower().removeprefix("www.")
+            now = _tm.monotonic()
+            last_t = last_fetch_by_domain.get(netloc, 0.0)
+            wait = min_interval_per_domain - (now - last_t)
+            if wait > 0:
+                _tm.sleep(wait)
+            last_fetch_by_domain[netloc] = _tm.monotonic()
         try:
             resp = safe_get(
                 candidate_url,
@@ -895,6 +910,8 @@ def run(urls_file: str, max_urls: int, snippet_len: int, threshold: int,
     # BSD ont les memes concurrents dans leur SERP, on ne fetch chaque URL
     # tierce qu'une seule fois.
     html_cache: dict[str, str | None] = {}
+    # F88bis : throttle per-domain pour les fetches phase 3.
+    last_fetch_by_domain: dict = {}
 
     # F88 (11/06) : pre-pass pour collecter tous les snippets de toutes
     # les fiches, puis POST en batch Standard Queue si active. Le mapping
@@ -902,15 +919,25 @@ def run(urls_file: str, max_urls: int, snippet_len: int, threshold: int,
     # lieu d'un appel synchrone par snippet.
     print(
         f"[manufacturer_dup_check] phase 1/3 : fetch {len(products)} fiches "
-        f"+ extraction snippets...",
+        f"+ extraction snippets (throttle 3s/fetch sur site audite)...",
         file=sys.stderr,
     )
+    import time as _time_p1
     fetched_pages = []
-    for entry in products:
+    for i, entry in enumerate(products):
+        # F88bis : throttle 3s entre fetches sur le site audite pour
+        # eviter les WAF anti-bot. 50 fiches × 3s = ~150s en plus.
+        if i > 0:
+            _time_p1.sleep(3.0)
         page = _fetch_snippet(
             entry["url"], snippet_len, timeout=timeout, cms_hint=cms_hint,
         )
         fetched_pages.append((entry, page))
+        if (i + 1) % 10 == 0:
+            print(
+                f"[manufacturer_dup_check]   ...{i + 1}/{len(products)} fiches fetched",
+                file=sys.stderr,
+            )
 
     snippet_to_response: dict = {}
     if use_standard_queue:
@@ -1037,6 +1064,8 @@ def run(urls_file: str, max_urls: int, snippet_len: int, threshold: int,
                         check = _validate_match_in_html(
                             cand["url"], snip_normalized, html_cache,
                             timeout=timeout,
+                            last_fetch_by_domain=last_fetch_by_domain,
+                            min_interval_per_domain=0.5,
                         )
                         if check["valid"]:
                             validated_domains.add(cand["domain"])
