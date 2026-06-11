@@ -784,15 +784,19 @@ def _select_random_crawl_products(
     # presque toujours d'une fiche produit. Le crawl peut etre tres
     # bruite (categories, pages techniques, etc.).
     product_url_patterns = [
-        re.compile(r"/produit[s]?/", re.IGNORECASE),
-        re.compile(r"/product[s]?/", re.IGNORECASE),
+        re.compile(r"/produit[s]?[-/]", re.IGNORECASE),
+        re.compile(r"/product[s]?[-/]", re.IGNORECASE),
         re.compile(r"-p\d+\.html?$", re.IGNORECASE),
         re.compile(r"-pid-\d+", re.IGNORECASE),
         re.compile(r"/article[s]?/", re.IGNORECASE),
-        re.compile(r"-f\d+\.html?$", re.IGNORECASE),  # PrestaShop fiche
-        re.compile(r"-\d{3,}-?\d*\.html?$"),           # PrestaShop product ID
+        re.compile(r"[-_]f\d+\.html?$", re.IGNORECASE),  # PrestaShop / Armurerie Gilles
+        re.compile(r"/\d+-\d+-[A-Za-z][\w-]*\.html$"),   # Roumaillac PrestaShop /cat/id-id-slug.html
+        re.compile(r"/accueil/\d+-", re.IGNORECASE),     # Tactirshop PrestaShop /accueil/<id>-<slug>
+        re.compile(r"/marque-produits/"),                # Beaurepaire pattern
+        re.compile(r"/collection-de-couteaux/[\w-]+/?$"),# Couteaux Morta /collection-de-couteaux/<slug>/
     ]
     candidates: list = []
+    seen_clean_urls: set = set()
     try:
         with open(crawl_pages_file, "r", encoding="utf-8") as f:
             for line in f:
@@ -804,17 +808,26 @@ def _select_random_crawl_products(
                 except json.JSONDecodeError:
                     continue
                 url = page.get("url")
-                if not url or url in halo_urls:
+                if not url:
+                    continue
+                # F88quater (12/06) : stripper le fragment "#..." des URLs
+                # (text-fragment Chrome, PrestaShop combinations attribute,
+                # ancres SPA). Sans ca, beaucoup d'URLs produit etaient
+                # ratees parce que le pattern .html devait etre en fin de
+                # chaine alors que le fragment trainait derriere.
+                clean_url = url.split("#", 1)[0]
+                if clean_url in halo_urls or clean_url in seen_clean_urls:
                     continue
                 status = page.get("status_code") or page.get("status")
                 if status and isinstance(status, int) and (status < 200 or status >= 400):
                     continue
-                netloc = urlparse(url).netloc.lower().removeprefix("www.")
+                netloc = urlparse(clean_url).netloc.lower().removeprefix("www.")
                 if audited_domain and netloc != audited_domain:
                     continue
-                if not any(p.search(url) for p in product_url_patterns):
+                if not any(p.search(clean_url) for p in product_url_patterns):
                     continue
-                candidates.append({"url": url, "type": "product_crawl_sample"})
+                seen_clean_urls.add(clean_url)
+                candidates.append({"url": clean_url, "type": "product_crawl_sample"})
     except OSError:
         return []
     if not candidates:
