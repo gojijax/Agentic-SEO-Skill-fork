@@ -175,6 +175,37 @@ def _is_ui_chrome(snippet: str) -> bool:
     return any(w in s for w in UI_GENERIC_WORDS)
 
 
+# F105 (16/06) : patterns d'URL qui ne sont PAS des fiches produit
+# concurrentes. Une "duplication de description produit" n'a de sens
+# que de fiche produit a fiche produit. Un article de blog, une page
+# "nos marques" ou une page categorie qui mentionne la marque matchent
+# le texte marque generique sans etre une vraie duplication de fiche.
+# Cas Tactirshop munition Sologne GPA : 3 des 5 sources etaient un blog
+# de rechargement (tirsportifchabris/blog/), une page liste de marques
+# (munichasse/nos-marques-vendues) et un produit d'un autre calibre.
+_NON_PRODUCT_SOURCE_PATTERNS = [
+    re.compile(r"/blog(?:/|$)", re.IGNORECASE),
+    re.compile(r"/article[s]?(?:/|$)", re.IGNORECASE),
+    re.compile(r"/actualit[ée]s?(?:/|$)", re.IGNORECASE),
+    re.compile(r"/conseils?(?:/|$)", re.IGNORECASE),
+    re.compile(r"/guide[s]?(?:/|$)", re.IGNORECASE),
+    re.compile(r"/news(?:/|$)", re.IGNORECASE),
+    # Pages liste de marques / fabricants (pas une fiche produit)
+    re.compile(r"/nos[-_]marques", re.IGNORECASE),
+    re.compile(r"/marques?[-_]vendues?", re.IGNORECASE),
+    re.compile(r"/(?:liste[-_]des[-_])?fabricants?(?:/|$)", re.IGNORECASE),
+]
+
+
+def _is_non_product_source_url(url: str) -> bool:
+    """True si l'URL source tierce ressemble a un blog/article/page liste
+    de marques plutot qu'a une fiche produit. Ces pages matchent le texte
+    marque generique, pas une vraie duplication de fiche."""
+    if not url:
+        return False
+    return any(p.search(url) for p in _NON_PRODUCT_SOURCE_PATTERNS)
+
+
 # Map a detected CMS to the subset of selectors most likely to identify its
 # long description block. When we know the CMS we try ONLY those selectors
 # first — avoids matching a foreign selector (e.g. WordPress .entry-content
@@ -749,6 +780,11 @@ def _parse_serp_response(payload: dict, audited_domain: str) -> dict:
             if not domain or domain == audited_domain or not url:
                 continue
             if _is_excluded_domain(domain):
+                continue
+            # F105 (16/06) : rejeter les sources blog/article/liste-marques
+            # qui matchent le texte marque generique sans etre une vraie
+            # duplication de fiche produit (faux positifs Tactirshop GPA).
+            if _is_non_product_source_url(url):
                 continue
             if url in seen_urls:
                 continue
