@@ -64,6 +64,12 @@ DATAFORSEO_TASK_GET = "https://api.dataforseo.com/v3/serp/google/organic/task_ge
 # une fiche revendeur qui copie le fabricant matche aussi sur eBay /
 # NaturaBuy parce que le vendeur copie aussi le fabricant. Ce n'est
 # pas un signal de duplication concurrentielle utile.
+# F111 (22/06) : ajout des agrégateurs d'annonces qui republient le
+# catalogue d'une boutique (clasf et ses sous-domaines pays). Cas
+# cuisinstore : `fr.clasf.com/q/...` cité comme preuve de copie tierce
+# alors que c'est clasf qui reprend la boutique, pas l'inverse. Le
+# matching est suffix-aware (cf. _is_marketplace_domain) pour couvrir
+# fr./es./www.clasf.com.
 MARKETPLACE_BLOCKLIST = frozenset({
     "naturabuy.fr",
     "ebay.fr", "ebay.com",
@@ -74,6 +80,7 @@ MARKETPLACE_BLOCKLIST = frozenset({
     "fnac.com",
     "vinted.fr",
     "aliexpress.com", "aliexpress.fr",
+    "clasf.com",
 })
 
 NOISE_TAGS = ("nav", "header", "footer", "aside", "script", "style", "noscript")
@@ -168,6 +175,17 @@ def _is_excluded_domain(domain: str) -> bool:
         return True
     # Match suffixes too (e.g. random.scene7.com)
     return any(d.endswith("." + x) or d == x for x in EXCLUDED_DOMAINS)
+
+
+def _is_marketplace_domain(domain: str) -> bool:
+    """True si le domaine est une marketplace ou un agrégateur d'annonces qui
+    republie le texte fabricant/boutique (faux positif structurel, pas un signal
+    de duplication concurrentielle). Suffix-aware pour couvrir les sous-domaines
+    pays (fr.clasf.com, es.clasf.com, www.…)."""
+    if not domain:
+        return False
+    d = domain.lower().removeprefix("www.")
+    return any(d == x or d.endswith("." + x) for x in MARKETPLACE_BLOCKLIST)
 
 
 def _is_ui_chrome(snippet: str) -> bool:
@@ -781,6 +799,12 @@ def _parse_serp_response(payload: dict, audited_domain: str) -> dict:
                 continue
             if _is_excluded_domain(domain):
                 continue
+            # F111 (22/06) : rejeter les marketplaces / agrégateurs d'annonces
+            # (clasf et co) qui republient le texte de la boutique. Faux positif
+            # structurel : la "duplication" est l'agrégateur qui reprend le
+            # prospect, pas un concurrent.
+            if _is_marketplace_domain(domain):
+                continue
             # F105 (16/06) : rejeter les sources blog/article/liste-marques
             # qui matchent le texte marque generique sans etre une vraie
             # duplication de fiche produit (faux positifs Tactirshop GPA).
@@ -1102,7 +1126,7 @@ def run(urls_file: str, max_urls: int, snippet_len: int, threshold: int,
                         # d'annonces qui republient le texte fabricant
                         # verbatim. Faux positifs structurels sans valeur
                         # de signal concurrentiel.
-                        if cand["domain"].lower() in MARKETPLACE_BLOCKLIST:
+                        if _is_marketplace_domain(cand["domain"]):
                             record["n2_rejected"].append({
                                 "domain": cand["domain"],
                                 "url": cand["url"],
