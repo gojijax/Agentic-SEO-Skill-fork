@@ -31,6 +31,17 @@ screenshots/
 plan.md
 tmp/
 
+# Outputs d'audit prospect qui ne doivent jamais vivre dans ce repo :
+# leur place est dans audit-prospect-ecommerce/audits/[domaine]/. Quand
+# un script BHUNA est lance depuis la racine ou scripts/, son output
+# atterrit au CWD ; ces patterns evitent qu'il pollue le repo moteur.
+00_consultant-pre-send-checks.md
+00_revue-*.md
+0[0-9]-*.md
+0[0-9]-*.html
+02-BHUNA-dashboard.html
+scripts/02-BHUNA-dashboard.html
+
 # Local secrets (never commit)
 .env
 .env.local
