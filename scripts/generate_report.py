@@ -78,6 +78,12 @@ BUSINESS_FOCUSED_SCRIPT_WHITELIST = {
     # Technique) est a brancher cote seo-skills-custom (consolidateur, Chunk 2).
     "robots",            # robots_checker.py
     "security",          # security_headers.py
+    # indexation : appel DataForSEO paye, mais reintegre 27/07 car sa sortie est
+    # desormais remontee en ALERTE sante (gap d'indexation / sitemap absent) cote
+    # bhuna_actions_builder._append_health_alerts, au lieu d'etre droppee. Pour un
+    # prospect (pas de Search Console), c'est le seul moyen de voir une
+    # desindexation.
+    "indexation",        # indexation_check.py
     # internal_links et link_profile RETIRES 01/06 apres revue MVP.
     # Raisons :
     # - internal_links.py : netloc strict www vs apex (bug confirme sur
