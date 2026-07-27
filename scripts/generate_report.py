@@ -51,10 +51,12 @@ BUSINESS_FOCUSED_SCRIPT_WHITELIST = {
     "image_inventory",   # image_inventory.py (alt texts)
     "product_schema",    # product_schema_checker.py
     "article",           # article_seo.py
-    # Contenu - Lisibilite / Originalite
+    # Contenu - Originalite
     "duplicate_content", # duplicate_content.py
-    "readability",       # readability.py
-    "freshness",         # freshness_checker.py
+    # readability et freshness RETIRES 27/07 (revue des controles, decision
+    # Nicolas). readability ne sort presque rien (Flesch mal calibre FR, findings
+    # droppes) et son score n'est pas utilise. freshness est muet (bug de mapping)
+    # et n'a de sens que sur un blog. Aucune perte cote roadmap.
     # Technique - Performance (ajoute 01/06 apres revue MVP).
     # Le script tourne pour obtenir le score 0-100. Les findings
     # detailles (LCP, INP, CLS, render-blocking, etc.) sont droppes
@@ -63,8 +65,19 @@ BUSINESS_FOCUSED_SCRIPT_WHITELIST = {
     # score est < 50. Au-dessus, rien (le prospect n'a pas besoin
     # d'une analyse Core Web Vitals detaillee, c'est un sujet hors
     # angle business-focused).
-    "pagespeed",         # pagespeed_checker.py
-    # Maillage interne :
+    "pagespeed",         # pagespeed.py (score CWV + action generique surfacee)
+    # Maillage interne (ajoute 27/07, revue des controles). Ces deux checks
+    # atteignent le pilier Maillage du livrable (reclasses au consolidateur) et
+    # etaient a tort exclus du business mode. broken_links est meme classe
+    # critique cote code alors qu'il etait saute.
+    "broken_links",      # broken_links.py (liens casses)
+    "redirects",         # redirect_checker.py (redirections, boucles)
+    # Porte de sante (ajoute 27/07). Tournent pour permettre une ALERTE si le
+    # site est casse ou bloque a Google (robots.txt bloquant, HTTPS absent).
+    # Pas cher (requetes HTTP). La remontee en alerte (au lieu du drop pilier
+    # Technique) est a brancher cote seo-skills-custom (consolidateur, Chunk 2).
+    "robots",            # robots_checker.py
+    "security",          # security_headers.py
     # internal_links et link_profile RETIRES 01/06 apres revue MVP.
     # Raisons :
     # - internal_links.py : netloc strict www vs apex (bug confirme sur
@@ -100,9 +113,10 @@ def _filter_analyses_for_business_mode(analyses: list) -> list:
 
 
 def _bhuna_mode() -> str:
-    """Retourne le mode d'audit BHUNA. Defaut 'complet' (tous les scripts).
-    'business' active la whitelist BUSINESS_FOCUSED_SCRIPT_WHITELIST."""
-    return os.environ.get("BHUNA_MODE", "complet").strip().lower()
+    """Mode d'audit BHUNA lu depuis l'env BHUNA_MODE. Chaine vide si non defini :
+    le defaut est alors decide au point d'application (business en hybride
+    prospect, complet en single-URL). 'business' active la whitelist."""
+    return os.environ.get("BHUNA_MODE", "").strip().lower()
 
 try:
     from lib.safe_http import safe_get
@@ -682,9 +696,13 @@ def collect_data(url: str, urls_file: str | None = None) -> dict:
         key = "image_weight" if target == url else f"image_weight:{target}"
         analyses.append((key, "image_weight_audit.py", [target]))
 
-    # Product schema validation on product URLs only
+    # Product schema validation on ONE representative product URL.
+    # 27/07 : le schema produit est templatise (meme structure sur tout le
+    # catalogue), une seule fiche suffit. Avant : une execution par fiche produit
+    # (7 a 10 appels pour la meme structure), le seul vrai multiplicateur par-URL.
     if urls_meta:
-        for prod_url in _urls_by_type(urls_meta, "product_strong", "product_weak", "product"):
+        _prod_urls = _urls_by_type(urls_meta, "product_strong", "product_weak", "product")
+        for prod_url in _prod_urls[:1]:
             analyses.append((f"product_schema:{prod_url}", "product_schema_checker.py", [prod_url]))
 
     # Freshness check on blog posts (relevant for articles, less so for product pages)
@@ -725,6 +743,13 @@ def collect_data(url: str, urls_file: str | None = None) -> dict:
     # les findings seraient filtres en aval (cf. _filter_actions_business_focused
     # cote seo-skills-custom). Economise 30-50% du temps d'audit.
     mode = _bhuna_mode()
+    # 27/07 : defaut fiabilise. En hybride (urls.json fourni = audit prospect),
+    # le mode business s'applique PAR DEFAUT meme si l'env BHUNA_MODE n'est pas
+    # pose. Avant, oublier la variable = suite complete lancee pour rien (cas
+    # constate sur TOUS les audits : mode=hybrid + 15 categories scorees). Un
+    # audit CLIENT qui veut la technique complete passe BHUNA_MODE=complet.
+    if not mode:
+        mode = "business" if urls_meta else "complet"
     if mode == "business":
         n_before = len(analyses)
         analyses = _filter_analyses_for_business_mode(analyses)
