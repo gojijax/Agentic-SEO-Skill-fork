@@ -808,12 +808,14 @@ def collect_data(url: str, urls_file: str | None = None) -> dict:
         dup_result = run_script(
             "manufacturer_dup_check.py",
             ["--urls-file", urls_file],
-            # 16/08 : 300 -> 600. Le check teste jusqu'a 20 fiches via la file
-            # d'attente STANDARD DataForSEO (async, plusieurs minutes) ; 300s
-            # etait trop court sur un catalogue produit dense (timeout spa-gonflable
-            # 16/08). Si 600 ne suffit toujours pas, le vrai levier est de baisser
-            # DEFAULT_MAX_URLS ou de basculer sur l'endpoint live (synchrone, plus cher).
-            timeout=600,
+            # 16/08 : 300 -> 900. Le check teste jusqu'a 20 fiches via la file
+            # d'attente STANDARD DataForSEO (async). Test spa-gonflable 16/08 : la
+            # phase 2 (file) a pris ~520s a elle seule (plus que les ~5min que le
+            # script annonce), + phase 1 fetch + phase 3 validation HTML. 300s
+            # coupait, 600s etait marginal, 900s donne une vraie marge. Le VRAI fix
+            # de fond (si 900 casse encore) est l'endpoint live DataForSEO
+            # (synchrone, pas de file d'attente, plus cher) ou baisser DEFAULT_MAX_URLS.
+            timeout=900,
         )
         elapsed = round(time.time() - start, 1)
         data["sections"]["manufacturer_dup_check"] = dup_result
