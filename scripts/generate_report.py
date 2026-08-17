@@ -808,7 +808,12 @@ def collect_data(url: str, urls_file: str | None = None) -> dict:
         dup_result = run_script(
             "manufacturer_dup_check.py",
             ["--urls-file", urls_file],
-            timeout=300,
+            # 16/08 : 300 -> 600. Le check teste jusqu'a 20 fiches via la file
+            # d'attente STANDARD DataForSEO (async, plusieurs minutes) ; 300s
+            # etait trop court sur un catalogue produit dense (timeout spa-gonflable
+            # 16/08). Si 600 ne suffit toujours pas, le vrai levier est de baisser
+            # DEFAULT_MAX_URLS ou de basculer sur l'endpoint live (synchrone, plus cher).
+            timeout=600,
         )
         elapsed = round(time.time() - start, 1)
         data["sections"]["manufacturer_dup_check"] = dup_result
