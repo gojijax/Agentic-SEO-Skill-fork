@@ -1041,10 +1041,17 @@ def run(urls_file: str, max_urls: int, snippet_len: int, threshold: int,
                     f"tasks posted, polling tasks_ready...",
                     file=sys.stderr,
                 )
+                # 16/08 : max_wait 1800 -> 780. Il DOIT rester sous le timeout du
+                # lanceur (generate_report : 900s), sinon le lanceur tue le script
+                # en plein poll et TOUTE la sortie est perdue (le script n'ecrit
+                # qu'a la fin) : on jetait 22 requetes DataForSEO deja payees sur
+                # 28 (spa-gonflable). A 780s, _dataforseo_wait_and_collect rend les
+                # resultats deja prets (partiels), la phase 3 tourne dessus et la
+                # sortie est ECRITE. Timeout = resultat partiel, plus perte totale.
                 task_results = _dataforseo_wait_and_collect(
                     list(snippet_to_task.values()),
                     login, password,
-                    poll_interval=30, max_wait=1800,
+                    poll_interval=30, max_wait=780,
                 )
                 snippet_to_response = {
                     snip: task_results.get(tid)
